@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, Mutex as AsyncMutex};
 use uuid::Uuid;
 use quinn::{Endpoint, ClientConfig as QuinnClientConfig, Connection};
 use rustls::client::danger;
@@ -12,7 +12,7 @@ use solana_streamer_sdk::streaming::event_parser::protocols::{
     bonk, pumpfun, pumpswap, raydium_amm_v4, raydium_clmm, raydium_cpmm, BlockMetaEvent
 };
 use solana_streamer_sdk::streaming::event_parser::core::UnifiedEvent;
-use fzstream_common::{SerializationProtocol, CompressionLevel, EventMessage, EventType, EventMetadata, TransactionEvent, AuthMessage, AuthResponse};
+use fzstream_common::{SerializationProtocol, EventMessage, EventType, TransactionEvent, AuthMessage, AuthResponse};
 
 /// Client connection status
 #[derive(Debug, Clone, PartialEq)]
@@ -26,8 +26,6 @@ pub enum ConnectionStatus {
     Error(String),
 }
 
-// 使用公共库中的类型定义
-
 /// Configuration for the stream client
 #[derive(Debug, Clone)]
 pub struct StreamClientConfig {
@@ -39,6 +37,8 @@ pub struct StreamClientConfig {
     pub max_reconnect_attempts: u32,
     pub connection_timeout: Duration,
     pub keep_alive_interval: Duration,
+    pub reconnect_backoff_multiplier: f64,
+    pub max_reconnect_backoff: Duration,
 }
 
 impl Default for StreamClientConfig {
@@ -52,6 +52,8 @@ impl Default for StreamClientConfig {
             max_reconnect_attempts: 10,
             connection_timeout: Duration::from_secs(10),
             keep_alive_interval: Duration::from_secs(30),
+            reconnect_backoff_multiplier: 1.5,
+            max_reconnect_backoff: Duration::from_secs(60),
         }
     }
 }
@@ -64,9 +66,12 @@ pub struct ClientStats {
     pub connection_attempts: u32,
     pub successful_connections: u32,
     pub reconnection_count: u32,
+    pub failed_reconnections: u32,
     pub last_event_time: Option<Instant>,
     pub average_latency_us: Option<u64>,
     pub connection_uptime: Duration,
+    pub last_connection_time: Option<Instant>,
+    pub total_uptime: Duration,
 }
 
 /// Event handler type
@@ -75,25 +80,38 @@ pub type EventHandler = Box<dyn Fn(TransactionEvent) + Send + Sync>;
 /// Status change handler type  
 pub type StatusHandler = Box<dyn Fn(ConnectionStatus) + Send + Sync>;
 
+/// UnifiedEvent handler type
+pub type UnifiedEventHandler = Box<dyn Fn(Box<dyn UnifiedEvent>) + Send + Sync>;
+
 pub struct FzStreamClient {
     config: StreamClientConfig,
     endpoint: Option<Endpoint>,
     connection: Option<Connection>,
     status: Arc<RwLock<ConnectionStatus>>,
     event_handler: Arc<RwLock<Option<EventHandler>>>,
+    unified_event_handler: Arc<RwLock<Option<UnifiedEventHandler>>>,
     status_handler: Arc<RwLock<Option<StatusHandler>>>,
     stats: Arc<RwLock<ClientStats>>,
     shutdown_tx: Option<broadcast::Sender<()>>,
+    reconnect_tx: Option<broadcast::Sender<()>>,
+    reconnect_handle: Arc<AsyncMutex<Option<tokio::task::JoinHandle<()>>>>,
+    current_reconnect_attempts: Arc<AsyncMutex<u32>>,
+    is_streaming: Arc<AsyncMutex<bool>>,
 }
 
 impl FzStreamClient {
     /// Create a new client with default configuration
     pub fn new() -> Self {
+        // 自动设置 rustls 加密提供者
+        Self::_install_crypto_provider();
         Self::with_config(StreamClientConfig::default())
     }
 
     /// Create a new client with custom configuration
     pub fn with_config(config: StreamClientConfig) -> Self {
+        // 自动设置 rustls 加密提供者
+        Self::_install_crypto_provider();
+        
         info!("📋 Configuration: server={}", config.server_address);
         
         Self {
@@ -102,15 +120,34 @@ impl FzStreamClient {
             connection: None,
             status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
             event_handler: Arc::new(RwLock::new(None)),
+            unified_event_handler: Arc::new(RwLock::new(None)),
             status_handler: Arc::new(RwLock::new(None)),
             stats: Arc::new(RwLock::new(ClientStats::default())),
             shutdown_tx: None,
+            reconnect_tx: None,
+            reconnect_handle: Arc::new(AsyncMutex::new(None)),
+            current_reconnect_attempts: Arc::new(AsyncMutex::new(0)),
+            is_streaming: Arc::new(AsyncMutex::new(false)),
         }
     }
 
     /// Builder pattern for easy configuration
     pub fn builder() -> StreamClientBuilder {
         StreamClientBuilder::new()
+    }
+
+    /// 内部方法：安装 rustls 加密提供者
+    fn _install_crypto_provider() {
+        // 使用 std::sync::Once 确保只初始化一次
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            match rustls::crypto::CryptoProvider::install_default(
+                rustls::crypto::ring::default_provider()
+            ) {
+                Ok(_) => debug!("🔐 Rustls crypto provider installed successfully"),
+                Err(_) => warn!("⚠️ Failed to install default crypto provider"),
+            }
+        });
     }
 
     /// Set event handler for processing received events
@@ -133,47 +170,200 @@ impl FzStreamClient {
         debug!("✅ Status change handler set");
     }
 
+    /// Set UnifiedEvent handler for processing received UnifiedEvents
+    pub async fn on_unified_event<F>(&self, handler: F)
+    where
+        F: Fn(Box<dyn UnifiedEvent>) + Send + Sync + 'static,
+    {
+        let mut unified_event_handler = self.unified_event_handler.write().await;
+        *unified_event_handler = Some(Box::new(handler));
+        debug!("✅ UnifiedEvent handler set");
+    }
+
 
     /// Connect to the server
     pub async fn connect(&mut self) -> Result<()> {
         info!("🔗 Starting connection to server: {}", self.config.server_address);
         self.set_status(ConnectionStatus::Connecting).await;
         
-        // Configure QUIC client
-        info!("⚙️ Configuring QUIC client...");
         let client_config = self.configure_quic_client()?;
-        info!("✅ QUIC client configuration created");
-        
-        // Create endpoint
-        info!("🔌 Creating QUIC endpoint...");
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
         endpoint.set_default_client_config(client_config);
-        info!("✅ QUIC endpoint created");
         
-        // Connect to server
         let server_addr = self.config.server_address.parse()?;
-        info!("🚀 Attempting connection to {}...", server_addr);
-        
         let connection = tokio::time::timeout(
             self.config.connection_timeout,
             endpoint.connect(server_addr, &self.config.server_name)?
         ).await??;
 
         info!("✅ Successfully connected to {}", self.config.server_address);
-        info!("🔗 Connection details: {:?}", connection.stats());
         
         self.endpoint = Some(endpoint);
         self.connection = Some(connection);
         self.set_status(ConnectionStatus::Connected).await;
+        
+        // Reset reconnect attempts on successful connection
+        {
+            let mut attempts = self.current_reconnect_attempts.lock().await;
+            *attempts = 0;
+        }
         
         // Update stats
         {
             let mut stats = self.stats.write().await;
             stats.connection_attempts += 1;
             stats.successful_connections += 1;
+            stats.last_connection_time = Some(Instant::now());
         }
 
         Ok(())
+    }
+
+    /// Attempt to reconnect with exponential backoff
+    async fn attempt_reconnect(&mut self) -> Result<()> {
+        let mut attempts = self.current_reconnect_attempts.lock().await;
+        *attempts += 1;
+        let current_attempt = *attempts;
+        drop(attempts);
+
+        if current_attempt > self.config.max_reconnect_attempts {
+            let error_msg = format!("Max reconnection attempts ({}) exceeded", self.config.max_reconnect_attempts);
+            self.set_status(ConnectionStatus::Error(error_msg.clone())).await;
+            return Err(anyhow::anyhow!(error_msg));
+        }
+
+        info!("🔄 Attempting reconnection #{}/{}", current_attempt, self.config.max_reconnect_attempts);
+        self.set_status(ConnectionStatus::Reconnecting).await;
+
+        // Calculate backoff delay
+        let base_delay = self.config.reconnect_interval;
+        let backoff_delay = std::cmp::min(
+            Duration::from_secs_f64(base_delay.as_secs_f64() * self.config.reconnect_backoff_multiplier.powi(current_attempt as i32 - 1)),
+            self.config.max_reconnect_backoff
+        );
+
+        info!("⏱️ Waiting {} seconds before reconnection attempt", backoff_delay.as_secs());
+        tokio::time::sleep(backoff_delay).await;
+
+        // Attempt to connect
+        match self.connect().await {
+            Ok(()) => {
+                info!("✅ Reconnection successful on attempt #{}", current_attempt);
+                {
+                    let mut stats = self.stats.write().await;
+                    stats.reconnection_count += 1;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                error!("❌ Reconnection attempt #{} failed: {}", current_attempt, e);
+                {
+                    let mut stats = self.stats.write().await;
+                    stats.failed_reconnections += 1;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Start automatic reconnection loop
+    async fn start_reconnect_loop(&mut self) {
+        if !self.config.auto_reconnect {
+            return;
+        }
+
+        let (reconnect_tx, mut reconnect_rx) = broadcast::channel(1);
+        self.reconnect_tx = Some(reconnect_tx);
+
+        let config = self.config.clone();
+        let status = Arc::clone(&self.status);
+        let is_streaming = Arc::clone(&self.is_streaming);
+
+        let handle = tokio::spawn(async move {
+            let mut backoff_delay = config.reconnect_interval;
+            let mut attempts = 0;
+
+            loop {
+                tokio::select! {
+                    _ = reconnect_rx.recv() => {
+                        info!("🛑 Reconnection loop stopped");
+                        break;
+                    }
+                    _ = tokio::time::sleep(backoff_delay) => {
+                        // Check if we should attempt reconnection
+                        let current_status = status.read().await;
+                        let streaming = is_streaming.lock().await;
+                        
+                        if (*current_status == ConnectionStatus::Disconnected || 
+                            *current_status == ConnectionStatus::Error("".to_string())) && 
+                            *streaming {
+                            
+                            drop(current_status);
+                            drop(streaming);
+                            
+                            attempts += 1;
+                            if attempts > config.max_reconnect_attempts {
+                                error!("❌ Max reconnection attempts exceeded");
+                                break;
+                            }
+
+                            info!("🔄 Auto-reconnection attempt #{}", attempts);
+                            
+                            // Calculate next backoff delay
+                            backoff_delay = std::cmp::min(
+                                Duration::from_secs_f64(backoff_delay.as_secs_f64() * config.reconnect_backoff_multiplier),
+                                config.max_reconnect_backoff
+                            );
+                        } else {
+                            // Reset backoff if we're connected
+                            backoff_delay = config.reconnect_interval;
+                            attempts = 0;
+                        }
+                    }
+                }
+            }
+        });
+
+        {
+            let mut reconnect_handle = self.reconnect_handle.lock().await;
+            *reconnect_handle = Some(handle);
+        }
+    }
+
+    /// Stop automatic reconnection
+    async fn stop_reconnect_loop(&mut self) {
+        if let Some(reconnect_tx) = &self.reconnect_tx {
+            let _ = reconnect_tx.send(());
+        }
+        
+        {
+            let mut reconnect_handle = self.reconnect_handle.lock().await;
+            if let Some(handle) = reconnect_handle.take() {
+                let _ = handle.abort();
+            }
+        }
+        
+        self.reconnect_tx = None;
+    }
+
+    /// Manually trigger reconnection
+    pub async fn reconnect(&mut self) -> Result<()> {
+        info!("🔄 Manual reconnection requested");
+        self.disconnect().await;
+        self.attempt_reconnect().await
+    }
+
+    /// Disconnect from server
+    pub async fn disconnect(&mut self) {
+        info!("🔌 Disconnecting from server");
+        
+        if let Some(connection) = &self.connection {
+            connection.close(quinn::VarInt::from_u32(0), b"Client disconnect");
+        }
+        
+        self.connection = None;
+        self.endpoint = None;
+        self.set_status(ConnectionStatus::Disconnected).await;
     }
 
     /// Authenticate with the server if auth token is provided
@@ -238,10 +428,16 @@ impl FzStreamClient {
         callback: F,
     ) -> Result<()>
     where
-        F: Fn(Box<dyn UnifiedEvent>) + Send + Sync + 'static,
+        F: Fn(Box<dyn UnifiedEvent>) + Send + Sync + 'static + Clone,
     {
         if self.connection.is_none() {
             return Err(anyhow::anyhow!("Not connected. Call connect() first."));
+        }
+
+        // Store the callback for reconnection
+        {
+            let mut unified_event_handler = self.unified_event_handler.write().await;
+            *unified_event_handler = Some(Box::new(callback.clone()));
         }
 
         // Authenticate if needed
@@ -250,8 +446,18 @@ impl FzStreamClient {
         self.set_status(ConnectionStatus::Streaming).await;
         info!("🚀 Starting event stream with UnifiedEvent callback...");
         
+        // Mark as streaming
+        {
+            let mut is_streaming = self.is_streaming.lock().await;
+            *is_streaming = true;
+        }
+        
+        // Start reconnection loop
+        self.start_reconnect_loop().await;
+        
         let connection = self.connection.as_ref().unwrap().clone();
         let stats = Arc::clone(&self.stats);
+        let status = Arc::clone(&self.status);
         
         // Create shutdown channel
         let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
@@ -338,6 +544,11 @@ impl FzStreamClient {
                             }
                             Err(e) => {
                                 error!("❌ Error accepting UnifiedEvent stream #{}: {}", stream_counter, e);
+                                // Connection lost, trigger reconnection
+                                {
+                                    let mut current_status = status.write().await;
+                                    *current_status = ConnectionStatus::Disconnected;
+                                }
                                 break;
                             }
                         }
@@ -356,7 +567,10 @@ impl FzStreamClient {
         raw_data: &[u8], 
     ) -> Result<Box<dyn UnifiedEvent>> {
         // 首先反序列化 EventMessage 包装器（总是用 bincode）
-        let event_message: EventMessage = bincode::deserialize(raw_data)?;
+        let mut event_message: EventMessage = bincode::deserialize(raw_data)?;
+        
+        // 设置客户端处理开始时间
+        event_message.set_client_processing_start();
         
         info!("📥 Received self-describing UnifiedEvent: serialization={:?}, compression={:?}, compressed={}", 
               event_message.serialization_format, event_message.compression_format, event_message.is_compressed);
@@ -365,7 +579,7 @@ impl FzStreamClient {
         let decompressed_data = event_message.get_decompressed_data().map_err(|e| anyhow::anyhow!("Failed to decompress data: {}", e))?;
         
         // 根据 EventMessage 中的序列化格式来解析
-        match event_message.serialization_format {
+        let result = match event_message.serialization_format {
             SerializationProtocol::JSON => {
                 // JSON 不支持 UnifiedEvent 回调
                 Err(anyhow::anyhow!("JSON events not supported for UnifiedEvent callback"))
@@ -377,7 +591,37 @@ impl FzStreamClient {
                 // 对于 Auto，尝试 bincode
                 Self::deserialize_solana_event_as_unified(&decompressed_data, &event_message.event_type)
             }
+        };
+        
+        // 设置客户端处理结束时间
+        event_message.set_client_processing_end();
+        
+        // 打印时间分析（只对有时间戳的事件）
+        if result.is_ok() {
+            // 检查是否有时间戳信息
+            if event_message.grpc_arrival_time > 0 {
+                let server_time = event_message.server_total_time_ms();
+                let client_time = event_message.client_processing_time_ms().unwrap_or(0);
+                let end_to_end = event_message.end_to_end_time_ms().unwrap_or(0);
+                
+                info!("⏱️ Transaction Timing - Event: {} | Server: {}ms | Client: {}ms | Total: {}ms", 
+                      event_message.event_id, server_time, client_time, end_to_end);
+                
+                // 如果总耗时超过阈值，用警告级别打印
+                if end_to_end > 100 {
+                    warn!("🚨 High Latency Alert - Event: {} | Total Time: {}ms", 
+                          event_message.event_id, end_to_end);
+                }
+            } else {
+                // 对于没有时间戳的真实事件，只打印客户端处理时间
+                if let Some(client_time) = event_message.client_processing_time_ms() {
+                    info!("⏱️ Client Processing Time - Event: {} | Client: {}ms", 
+                          event_message.event_id, client_time);
+                }
+            }
         }
+        
+        result
     }
 
     /// Deserialize Solana event from bincode data as UnifiedEvent
@@ -621,9 +865,77 @@ impl FzStreamClient {
         self.stats.read().await.clone()
     }
 
+    /// Check connection health and attempt reconnection if needed
+    pub async fn check_connection_health(&mut self) -> Result<bool> {
+        let current_status = self.get_status().await;
+        
+        match current_status {
+            ConnectionStatus::Disconnected | ConnectionStatus::Error(_) => {
+                let is_streaming = {
+                    let streaming = self.is_streaming.lock().await;
+                    *streaming
+                };
+                
+                if is_streaming && self.config.auto_reconnect {
+                    info!("🔍 Connection lost, attempting automatic reconnection...");
+                    match self.attempt_reconnect().await {
+                        Ok(()) => {
+                            info!("✅ Automatic reconnection successful");
+                            Ok(true)
+                        }
+                        Err(e) => {
+                            error!("❌ Automatic reconnection failed: {}", e);
+                            Ok(false)
+                        }
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+            ConnectionStatus::Connected | ConnectionStatus::Authenticated | ConnectionStatus::Streaming => {
+                // Check if connection is still alive
+                if let Some(connection) = &self.connection {
+                    if connection.close_reason().is_some() {
+                        info!("🔍 Connection closed by server, attempting reconnection...");
+                        self.disconnect().await;
+                        if self.config.auto_reconnect {
+                            self.attempt_reconnect().await?;
+                        }
+                        Ok(true)
+                    } else {
+                        Ok(true)
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+            _ => Ok(false)
+        }
+    }
+
+    /// Get current reconnection attempts count
+    pub async fn get_reconnect_attempts(&self) -> u32 {
+        self.current_reconnect_attempts.lock().await.clone()
+    }
+
+    /// Reset reconnection attempts counter
+    pub async fn reset_reconnect_attempts(&mut self) {
+        let mut attempts = self.current_reconnect_attempts.lock().await;
+        *attempts = 0;
+    }
+
     /// Shutdown the client
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("🔌 Shutting down Fast Stream Client...");
+        
+        // Stop reconnection loop
+        self.stop_reconnect_loop().await;
+        
+        // Mark as not streaming
+        {
+            let mut is_streaming = self.is_streaming.lock().await;
+            *is_streaming = false;
+        }
         
         if let Some(shutdown_tx) = &self.shutdown_tx {
             let _ = shutdown_tx.send(());
@@ -761,8 +1073,33 @@ impl StreamClientBuilder {
         self
     }
 
+    pub fn reconnect_interval(mut self, interval: Duration) -> Self {
+        self.config.reconnect_interval = interval;
+        self
+    }
+
+    pub fn max_reconnect_attempts(mut self, attempts: u32) -> Self {
+        self.config.max_reconnect_attempts = attempts;
+        self
+    }
+
+    pub fn reconnect_backoff_multiplier(mut self, multiplier: f64) -> Self {
+        self.config.reconnect_backoff_multiplier = multiplier;
+        self
+    }
+
+    pub fn max_reconnect_backoff(mut self, max_backoff: Duration) -> Self {
+        self.config.max_reconnect_backoff = max_backoff;
+        self
+    }
+
     pub fn connection_timeout(mut self, timeout: Duration) -> Self {
         self.config.connection_timeout = timeout;
+        self
+    }
+
+    pub fn keep_alive_interval(mut self, interval: Duration) -> Self {
+        self.config.keep_alive_interval = interval;
         self
     }
 

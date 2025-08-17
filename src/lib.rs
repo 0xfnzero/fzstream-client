@@ -44,7 +44,6 @@
 
 mod config;
 mod compression;
-mod auth;
 mod client;
 
 // Re-export main types
