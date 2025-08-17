@@ -1,30 +1,18 @@
-// Fast Stream Client SDK - Simple and easy-to-use QUIC client SDK with bincode support
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 use quinn::{Endpoint, ClientConfig as QuinnClientConfig, Connection};
-use rustls::{ClientConfig as RustlsClientConfig, client::danger};
+use rustls::client::danger;
 use anyhow::Result;
 use log::{info, warn, error, debug};
-use serde::{Serialize, Deserialize};
 use serde_json;
-use base64::prelude::*;
 
 use solana_streamer_sdk::streaming::event_parser::protocols::{
-    bonk,
-    pumpfun,
-    pumpswap,
-    raydium_amm_v4,
-    raydium_clmm,
+    bonk, pumpfun, pumpswap, raydium_amm_v4, raydium_clmm, raydium_cpmm, BlockMetaEvent
 };
 use solana_streamer_sdk::streaming::event_parser::core::UnifiedEvent;
-use fzstream_common::{SerializationProtocol, CompressionLevel, CompressionType, EventMessage, EventType, EventMetadata, SolanaEventWrapper, TransactionEvent, AuthMessage, AuthResponse};
-use crate::compression::decompress_data;
-
-/// SDK version information
-pub const SDK_VERSION: &str = "1.0.0";
-pub const SDK_NAME: &str = "fz-stream-client";
+use fzstream_common::{SerializationProtocol, CompressionLevel, EventMessage, EventType, EventMetadata, TransactionEvent, AuthMessage, AuthResponse};
 
 /// Client connection status
 #[derive(Debug, Clone, PartialEq)]
@@ -46,8 +34,6 @@ pub struct StreamClientConfig {
     pub server_address: String,
     pub server_name: String,
     pub auth_token: Option<String>,
-    pub protocol: SerializationProtocol,
-    pub compression: CompressionLevel,
     pub auto_reconnect: bool,
     pub reconnect_interval: Duration,
     pub max_reconnect_attempts: u32,
@@ -61,8 +47,6 @@ impl Default for StreamClientConfig {
             server_address: "127.0.0.1:8080".to_string(),
             server_name: "localhost".to_string(),
             auth_token: None,
-            protocol: SerializationProtocol::Auto,
-            compression: CompressionLevel::LZ4Fast,
             auto_reconnect: true,
             reconnect_interval: Duration::from_secs(5),
             max_reconnect_attempts: 10,
@@ -110,8 +94,7 @@ impl FzStreamClient {
 
     /// Create a new client with custom configuration
     pub fn with_config(config: StreamClientConfig) -> Self {
-        info!("📋 Configuration: server={}, protocol={:?}, compression={:?}", 
-              config.server_address, config.protocol, config.compression);
+        info!("📋 Configuration: server={}", config.server_address);
         
         Self {
             config,
@@ -153,23 +136,31 @@ impl FzStreamClient {
 
     /// Connect to the server
     pub async fn connect(&mut self) -> Result<()> {
+        info!("🔗 Starting connection to server: {}", self.config.server_address);
         self.set_status(ConnectionStatus::Connecting).await;
         
         // Configure QUIC client
+        info!("⚙️ Configuring QUIC client...");
         let client_config = self.configure_quic_client()?;
+        info!("✅ QUIC client configuration created");
         
         // Create endpoint
+        info!("🔌 Creating QUIC endpoint...");
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
         endpoint.set_default_client_config(client_config);
+        info!("✅ QUIC endpoint created");
         
         // Connect to server
         let server_addr = self.config.server_address.parse()?;
+        info!("🚀 Attempting connection to {}...", server_addr);
+        
         let connection = tokio::time::timeout(
             self.config.connection_timeout,
             endpoint.connect(server_addr, &self.config.server_name)?
         ).await??;
 
-        info!("✅ Connected to {}", self.config.server_address);
+        info!("✅ Successfully connected to {}", self.config.server_address);
+        info!("🔗 Connection details: {:?}", connection.stats());
         
         self.endpoint = Some(endpoint);
         self.connection = Some(connection);
@@ -256,15 +247,16 @@ impl FzStreamClient {
         let connection = self.connection.as_ref().unwrap().clone();
         let event_handler = Arc::clone(&self.event_handler);
         let stats = Arc::clone(&self.stats);
-        let protocol = self.config.protocol.clone();
-        let compression = self.config.compression.clone();
         
         // Create shutdown channel
         let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
         self.shutdown_tx = Some(shutdown_tx);
         
-        // Start receiving events
+        // Start receiving events with comprehensive logging
         tokio::spawn(async move {
+            info!("🔄 Starting event receive loop...");
+            let mut stream_counter = 0;
+            
             loop {
                 tokio::select! {
                     _ = shutdown_rx.recv() => {
@@ -272,54 +264,87 @@ impl FzStreamClient {
                         break;
                     }
                     stream_result = connection.accept_uni() => {
+                        stream_counter += 1;
+                        info!("📥 Incoming stream #{}: {:?}", stream_counter, stream_result);
+                        
                         match stream_result {
                             Ok(mut recv_stream) => {
+                                info!("✅ Stream #{} accepted successfully", stream_counter);
                                 let mut buffer = Vec::new();
                                 let mut chunk = [0u8; 4096];
+                                let mut total_bytes_read = 0;
+                                let mut read_iterations = 0;
                                 
                                 // Read all data from stream
                                 loop {
+                                    read_iterations += 1;
+                                    debug!("🔍 Reading iteration #{} from stream #{}", read_iterations, stream_counter);
+                                    
                                     match recv_stream.read(&mut chunk).await {
                                         Ok(Some(n)) => {
+                                            total_bytes_read += n;
                                             buffer.extend_from_slice(&chunk[..n]);
+                                            info!("📦 Read {} bytes in iteration #{} (total: {} bytes)", n, read_iterations, total_bytes_read);
                                         }
-                                        Ok(None) => break, // Stream ended
+                                        Ok(None) => {
+                                            info!("🏁 Stream #{} ended after {} iterations, total bytes: {}", stream_counter, read_iterations, total_bytes_read);
+                                            break; // Stream ended
+                                        }
                                         Err(e) => {
-                                            error!("❌ Error reading from stream: {}", e);
+                                            error!("❌ Error reading from stream #{}: {}", stream_counter, e);
                                             break;
                                         }
                                     }
                                 }
                                 
                                 if !buffer.is_empty() {
+                                    info!("🎯 Processing {} bytes from stream #{}", buffer.len(), stream_counter);
+                                    
+                                    // Log buffer content for debugging
+                                    debug!("📝 Buffer content (first 100 bytes): {:?}", &buffer[..std::cmp::min(100, buffer.len())]);
+                                    
                                     // Try to process the event
-                                    if let Ok(event) = Self::parse_event_data(&buffer, &protocol, &compression) {
-                                        // Update stats
-                                        {
-                                            let mut stats_guard = stats.write().await;
-                                            stats_guard.events_received += 1;
-                                            stats_guard.bytes_received += buffer.len() as u64;
-                                            stats_guard.last_event_time = Some(Instant::now());
+                                    match Self::parse_event_data(&buffer) {
+                                        Ok(event) => {
+                                            info!("✅ Successfully parsed event from stream #{}: type={:?}, id={}", 
+                                                   stream_counter, event.event_type, event.event_id);
+                                            
+                                            // Update stats
+                                            {
+                                                let mut stats_guard = stats.write().await;
+                                                stats_guard.events_received += 1;
+                                                stats_guard.bytes_received += buffer.len() as u64;
+                                                stats_guard.last_event_time = Some(Instant::now());
+                                            }
+                                            
+                                            // Call event handler
+                                            if let Some(handler) = event_handler.read().await.as_ref() {
+                                                info!("🎭 Calling event handler for event: {}", event.event_id);
+                                                handler(event);
+                                            } else {
+                                                warn!("⚠️ No event handler registered to process event: {}", event.event_id);
+                                            }
                                         }
-                                        
-                                        
-                                        // Call event handler
-                                        if let Some(handler) = event_handler.read().await.as_ref() {
-                                            handler(event);
+                                        Err(e) => {
+                                            error!("❌ Failed to parse event data from stream #{}: {} (buffer size: {})", 
+                                                   stream_counter, e, buffer.len());
+                                            debug!("🔍 Failed buffer hex dump: {}", hex::encode(&buffer[..std::cmp::min(200, buffer.len())]));
                                         }
-                                    } else {
-                                        debug!("⚠️ Failed to parse event data, {} bytes received", buffer.len());
                                     }
+                                } else {
+                                    warn!("⚠️ Stream #{} ended with no data", stream_counter);
                                 }
                             }
                             Err(e) => {
-                                error!("❌ Error accepting stream: {}", e);
+                                error!("❌ Error accepting stream #{}: {}", stream_counter, e);
                                 break;
                             }
                         }
                     }
                 }
             }
+            
+            info!("🔚 Event receive loop ended after processing {} streams", stream_counter);
         });
         
         Ok(())
@@ -345,142 +370,159 @@ impl FzStreamClient {
         
         let connection = self.connection.as_ref().unwrap().clone();
         let stats = Arc::clone(&self.stats);
-        let protocol = self.config.protocol.clone();
-        let compression = self.config.compression.clone();
         
         // Create shutdown channel
         let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
         self.shutdown_tx = Some(shutdown_tx);
         
-        // Start receiving events
+        // Start receiving events with comprehensive logging for UnifiedEvent callbacks
         tokio::spawn(async move {
+            info!("🔄 Starting UnifiedEvent receive loop...");
+            let mut stream_counter = 0;
+            
             loop {
                 tokio::select! {
                     _ = shutdown_rx.recv() => {
-                        info!("📡 Event stream shutdown requested");
+                        info!("📡 UnifiedEvent stream shutdown requested");
                         break;
                     }
                     stream_result = connection.accept_uni() => {
+                        stream_counter += 1;
+                        info!("📥 Incoming UnifiedEvent stream #{}: {:?}", stream_counter, stream_result);
+                        
                         match stream_result {
                             Ok(mut recv_stream) => {
+                                info!("✅ UnifiedEvent stream #{} accepted successfully", stream_counter);
                                 let mut buffer = Vec::new();
                                 let mut chunk = [0u8; 4096];
+                                let mut total_bytes_read = 0;
+                                let mut read_iterations = 0;
                                 
                                 // Read all data from stream
                                 loop {
+                                    read_iterations += 1;
+                                    debug!("🔍 UnifiedEvent reading iteration #{} from stream #{}", read_iterations, stream_counter);
+                                    
                                     match recv_stream.read(&mut chunk).await {
                                         Ok(Some(n)) => {
+                                            total_bytes_read += n;
                                             buffer.extend_from_slice(&chunk[..n]);
+                                            info!("📦 UnifiedEvent read {} bytes in iteration #{} (total: {} bytes)", n, read_iterations, total_bytes_read);
                                         }
-                                        Ok(None) => break, // Stream ended
+                                        Ok(None) => {
+                                            info!("🏁 UnifiedEvent stream #{} ended after {} iterations, total bytes: {}", stream_counter, read_iterations, total_bytes_read);
+                                            break; // Stream ended
+                                        }
                                         Err(e) => {
-                                            error!("❌ Error reading from stream: {}", e);
+                                            error!("❌ Error reading from UnifiedEvent stream #{}: {}", stream_counter, e);
                                             break;
                                         }
                                     }
                                 }
                                 
                                 if !buffer.is_empty() {
-                                    info!("📥 Received {} bytes from QUIC server", buffer.len());
+                                    info!("🎯 Processing {} bytes from UnifiedEvent stream #{}", buffer.len(), stream_counter);
+                                    
+                                    // Log buffer content for debugging
+                                    debug!("📝 UnifiedEvent buffer content (first 100 bytes): {:?}", &buffer[..std::cmp::min(100, buffer.len())]);
+                                    
                                     // Try to process the event and call callback with UnifiedEvent
-                                    if let Ok(unified_event) = Self::parse_event_data_as_unified(&buffer, &protocol, &compression) {
-                                        // Update stats
-                                        {
-                                            let mut stats_guard = stats.write().await;
-                                            stats_guard.events_received += 1;
-                                            stats_guard.bytes_received += buffer.len() as u64;
-                                            stats_guard.last_event_time = Some(Instant::now());
+                                    match Self::parse_event_data_as_unified(&buffer) {
+                                        Ok(unified_event) => {
+                                            info!("✅ Successfully parsed UnifiedEvent from stream #{}: type={:?}, id={}", 
+                                                   stream_counter, unified_event.event_type(), unified_event.id());
+                                            
+                                            // Update stats
+                                            {
+                                                let mut stats_guard = stats.write().await;
+                                                stats_guard.events_received += 1;
+                                                stats_guard.bytes_received += buffer.len() as u64;
+                                                stats_guard.last_event_time = Some(Instant::now());
+                                            }
+                                            
+                                            // Call the callback with UnifiedEvent
+                                            info!("🎭 Calling UnifiedEvent callback for event: {}", unified_event.id());
+                                            callback(unified_event);
                                         }
-                                        
-                                        // Call the callback with UnifiedEvent
-                                        callback(unified_event);
-                                    } else {
-                                        error!("⚠️ Failed to parse event data as UnifiedEvent, {} bytes received", buffer.len());
+                                        Err(e) => {
+                                            error!("❌ Failed to parse UnifiedEvent data from stream #{}: {} (buffer size: {})", 
+                                                   stream_counter, e, buffer.len());
+                                            debug!("🔍 Failed UnifiedEvent buffer hex dump: {}", hex::encode(&buffer[..std::cmp::min(200, buffer.len())]));
+                                        }
                                     }
+                                } else {
+                                    warn!("⚠️ UnifiedEvent stream #{} ended with no data", stream_counter);
                                 }
                             }
                             Err(e) => {
-                                error!("❌ Error accepting stream: {}", e);
+                                error!("❌ Error accepting UnifiedEvent stream #{}: {}", stream_counter, e);
                                 break;
                             }
                         }
                     }
                 }
             }
+            
+            info!("🔚 UnifiedEvent receive loop ended after processing {} streams", stream_counter);
         });
         
         Ok(())
     }
 
-    /// Parse event data based on protocol and compression
+    /// Parse event data - now EventMessage is self-describing
     fn parse_event_data(
         raw_data: &[u8], 
-        protocol: &SerializationProtocol,
-        compression: &CompressionLevel
     ) -> Result<TransactionEvent> {
-        // Handle compression if enabled
-        let decompressed_data = if matches!(compression, CompressionLevel::None) {
-            raw_data.to_vec()
-        } else {
-            let compression_type = match compression {
-                CompressionLevel::LZ4Fast | CompressionLevel::LZ4High => CompressionType::LZ4,
-                CompressionLevel::ZstdFast | CompressionLevel::ZstdMedium 
-                | CompressionLevel::ZstdHigh | CompressionLevel::ZstdMax => CompressionType::Zstd,
-                CompressionLevel::None => CompressionType::None,
-            };
-            decompress_data(raw_data, &compression_type)?
-        };
-
-        // Parse according to protocol
-        match protocol {
+        // 首先反序列化 EventMessage 包装器（总是用 bincode）
+        let event_message: EventMessage = bincode::deserialize(raw_data)?;
+        
+        info!("📥 Received self-describing EventMessage: serialization={:?}, compression={:?}, compressed={}", 
+              event_message.serialization_format, event_message.compression_format, event_message.is_compressed);
+        
+        // 使用 EventMessage 中的格式信息来解压缩和反序列化数据
+        let decompressed_data = event_message.get_decompressed_data().map_err(|e| anyhow::anyhow!("Failed to decompress data: {}", e))?;
+        
+        // 根据 EventMessage 中的序列化格式来解析
+        match event_message.serialization_format {
             SerializationProtocol::JSON => {
                 Self::parse_json_event(&decompressed_data)
             }
             SerializationProtocol::Bincode => {
-                Self::parse_bincode_event(&decompressed_data)
+                Self::deserialize_inner_bincode_event(&decompressed_data, &event_message.event_type, &event_message.event_id, event_message.timestamp)
             }
             SerializationProtocol::Auto => {
-                // Try bincode first, fallback to JSON
-                Self::parse_bincode_event(&decompressed_data)
+                // 对于 Auto，尝试 bincode 首先
+                Self::deserialize_inner_bincode_event(&decompressed_data, &event_message.event_type, &event_message.event_id, event_message.timestamp)
                     .or_else(|_| Self::parse_json_event(&decompressed_data))
             }
         }
     }
 
-    /// Parse event data as UnifiedEvent based on protocol and compression
+    /// Parse event data as UnifiedEvent - now EventMessage is self-describing
     fn parse_event_data_as_unified(
         raw_data: &[u8], 
-        protocol: &SerializationProtocol,
-        compression: &CompressionLevel
     ) -> Result<Box<dyn UnifiedEvent>> {
-        // Handle compression if enabled
-        let decompressed_data = if matches!(compression, CompressionLevel::None) {
-            raw_data.to_vec()
-        } else {
-            let compression_type = match compression {
-                CompressionLevel::LZ4Fast | CompressionLevel::LZ4High => CompressionType::LZ4,
-                CompressionLevel::ZstdFast | CompressionLevel::ZstdMedium 
-                | CompressionLevel::ZstdHigh | CompressionLevel::ZstdMax => CompressionType::Zstd,
-                CompressionLevel::None => CompressionType::None,
-            };
-            decompress_data(raw_data, &compression_type)?
-        };
-
-        // Parse according to protocol
-        match protocol {
+        // 首先反序列化 EventMessage 包装器（总是用 bincode）
+        let event_message: EventMessage = bincode::deserialize(raw_data)?;
+        
+        info!("📥 Received self-describing UnifiedEvent: serialization={:?}, compression={:?}, compressed={}", 
+              event_message.serialization_format, event_message.compression_format, event_message.is_compressed);
+        
+        // 使用 EventMessage 中的格式信息来解压缩数据
+        let decompressed_data = event_message.get_decompressed_data().map_err(|e| anyhow::anyhow!("Failed to decompress data: {}", e))?;
+        
+        // 根据 EventMessage 中的序列化格式来解析
+        match event_message.serialization_format {
             SerializationProtocol::JSON => {
-                // For JSON, we need to convert to UnifiedEvent
-                let event: TransactionEvent = serde_json::from_slice(&decompressed_data)?;
-                // Convert TransactionEvent to UnifiedEvent (this is a simplified approach)
+                // JSON 不支持 UnifiedEvent 回调
                 Err(anyhow::anyhow!("JSON events not supported for UnifiedEvent callback"))
             }
             SerializationProtocol::Bincode => {
-                Self::parse_bincode_event_as_unified(&decompressed_data)
+                Self::deserialize_solana_event_as_unified(&decompressed_data, &event_message.event_type)
             }
             SerializationProtocol::Auto => {
-                // Try bincode first, fallback to JSON
-                Self::parse_bincode_event_as_unified(&decompressed_data)
-                    .or_else(|_| Err(anyhow::anyhow!("Auto fallback to JSON not supported for UnifiedEvent")))
+                // 对于 Auto，尝试 bincode
+                Self::deserialize_solana_event_as_unified(&decompressed_data, &event_message.event_type)
             }
         }
     }
@@ -526,6 +568,32 @@ impl FzStreamClient {
             }),
         })
     }
+    
+    /// 处理内部数据的 bincode 反序列化（新的自描述格式）
+    fn deserialize_inner_bincode_event(
+        data: &[u8], 
+        event_type: &EventType, 
+        event_id: &str, 
+        timestamp: u64
+    ) -> Result<TransactionEvent> {
+        // 反序列化内部的 Solana 事件数据
+        let solana_event = Self::deserialize_solana_event(data, event_type)?;
+        
+        Ok(TransactionEvent {
+            event_id: event_id.to_string(),
+            event_type: event_type.clone(),
+            timestamp,
+            data: serde_json::to_value(solana_event)?,
+            metadata: Some(EventMetadata {
+                block_time: None,
+                slot: None,
+                signature: None,
+                source: None,
+                priority: None,
+                additional_fields: std::collections::HashMap::new(),
+            }),
+        })
+    }
 
     /// Deserialize Solana event from bincode data as UnifiedEvent
     fn deserialize_solana_event_as_unified(data: &[u8], event_type: &EventType) -> Result<Box<dyn UnifiedEvent>> {
@@ -534,7 +602,7 @@ impl FzStreamClient {
         // Try to deserialize as the specific Solana event type
         match event_type {
             EventType::BlockMeta => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::BlockMetaEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<BlockMetaEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
@@ -574,177 +642,177 @@ impl FzStreamClient {
                 }
             },
             EventType::PumpSwapBuy => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapBuyEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapBuyEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::PumpSwapSell => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapSellEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapSellEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::PumpSwapCreate => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapCreatePoolEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapCreatePoolEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::PumpSwapDeposit => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapDepositEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapDepositEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::PumpSwapWithdraw => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapWithdrawEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapWithdrawEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumCpmmSwap => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmSwapEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmSwapEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumCpmmDeposit => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmDepositEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmDepositEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumCpmmInitialize => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmInitializeEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmInitializeEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumCpmmWithdraw => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmWithdrawEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmWithdrawEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumClmmSwap => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmSwapEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmSwapEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumClmmSwapV2 => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmSwapV2Event>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmSwapV2Event>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumClmmClosePosition => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmClosePositionEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmClosePositionEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumClmmDecreaseLiquidityV2 => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmDecreaseLiquidityV2Event>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmDecreaseLiquidityV2Event>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumClmmCreatePool => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmCreatePoolEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmCreatePoolEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumClmmIncreaseLiquidityV2 => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmIncreaseLiquidityV2Event>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmIncreaseLiquidityV2Event>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumClmmOpenPositionWithToken22Nft => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmOpenPositionWithToken22NftEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmOpenPositionWithToken22NftEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumClmmOpenPositionV2 => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmOpenPositionV2Event>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmOpenPositionV2Event>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumAmmV4Swap => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_amm_v4::RaydiumAmmV4SwapEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4SwapEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumAmmV4Deposit => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_amm_v4::RaydiumAmmV4DepositEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4DepositEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumAmmV4Initialize => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_amm_v4::RaydiumAmmV4Initialize2Event>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4Initialize2Event>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumAmmV4Withdraw => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_amm_v4::RaydiumAmmV4WithdrawEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4WithdrawEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumAmmV4WithdrawPnl => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_amm_v4::RaydiumAmmV4WithdrawPnlEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4WithdrawPnlEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::BonkPoolStateAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::bonk::BonkPoolStateAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<bonk::BonkPoolStateAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::BonkGlobalConfigAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::bonk::BonkGlobalConfigAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<bonk::BonkGlobalConfigAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::BonkPlatformConfigAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::bonk::BonkPlatformConfigAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<bonk::BonkPlatformConfigAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::PumpSwapGlobalConfigAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapGlobalConfigAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapGlobalConfigAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::PumpSwapPoolAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapPoolAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapPoolAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::PumpFunBondingCurveAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpfun::PumpFunBondingCurveAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpfun::PumpFunBondingCurveAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::PumpFunGlobalAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpfun::PumpFunGlobalAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpfun::PumpFunGlobalAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumAmmV4InfoAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_amm_v4::RaydiumAmmV4AmmInfoAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4AmmInfoAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumClmmConfigAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmAmmConfigAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmAmmConfigAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumClmmPoolStateAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmPoolStateAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmPoolStateAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumClmmTickArrayAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmTickArrayStateAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmTickArrayStateAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumCpmmConfigAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmAmmConfigAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmAmmConfigAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::RaydiumCpmmPoolStateAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmPoolStateAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmPoolStateAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
@@ -763,7 +831,7 @@ impl FzStreamClient {
         // Try to deserialize as the specific Solana event type
         match event_type {
             EventType::BlockMeta => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::BlockMetaEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<BlockMetaEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
@@ -803,178 +871,178 @@ impl FzStreamClient {
                 }
             },
             EventType::PumpSwapBuy => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapBuyEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapBuyEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::PumpSwapSell => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapSellEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapSellEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::PumpSwapCreate => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapCreatePoolEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapCreatePoolEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::PumpSwapDeposit => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapDepositEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapDepositEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::PumpSwapWithdraw => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapWithdrawEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapWithdrawEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumCpmmSwap => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmSwapEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmSwapEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumCpmmDeposit => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmDepositEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmDepositEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumCpmmInitialize => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmInitializeEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmInitializeEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumCpmmWithdraw => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmWithdrawEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmWithdrawEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumClmmSwap => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmSwapEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmSwapEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumClmmSwapV2 => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmSwapV2Event>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmSwapV2Event>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumClmmClosePosition => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmClosePositionEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmClosePositionEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumClmmDecreaseLiquidityV2 => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmDecreaseLiquidityV2Event>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmDecreaseLiquidityV2Event>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumClmmCreatePool => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmCreatePoolEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmCreatePoolEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumClmmIncreaseLiquidityV2 => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmIncreaseLiquidityV2Event>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmIncreaseLiquidityV2Event>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumClmmOpenPositionWithToken22Nft => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmOpenPositionWithToken22NftEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmOpenPositionWithToken22NftEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumClmmOpenPositionV2 => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmOpenPositionV2Event>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmOpenPositionV2Event>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumAmmV4Swap => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_amm_v4::RaydiumAmmV4SwapEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4SwapEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumAmmV4Deposit => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_amm_v4::RaydiumAmmV4DepositEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4DepositEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumAmmV4Initialize => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_amm_v4::RaydiumAmmV4Initialize2Event>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4Initialize2Event>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumAmmV4Withdraw => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_amm_v4::RaydiumAmmV4WithdrawEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4WithdrawEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumAmmV4WithdrawPnl => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_amm_v4::RaydiumAmmV4WithdrawPnlEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4WithdrawPnlEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             // Account events
             EventType::BonkPoolStateAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::bonk::BonkPoolStateAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<bonk::BonkPoolStateAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::BonkGlobalConfigAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::bonk::BonkGlobalConfigAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<bonk::BonkGlobalConfigAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::BonkPlatformConfigAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::bonk::BonkPlatformConfigAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<bonk::BonkPlatformConfigAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::PumpSwapGlobalConfigAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapGlobalConfigAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapGlobalConfigAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::PumpSwapPoolAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpswap::PumpSwapPoolAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapPoolAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::PumpFunBondingCurveAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpfun::PumpFunBondingCurveAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpfun::PumpFunBondingCurveAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::PumpFunGlobalAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::pumpfun::PumpFunGlobalAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<pumpfun::PumpFunGlobalAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumAmmV4InfoAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_amm_v4::RaydiumAmmV4AmmInfoAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4AmmInfoAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumClmmConfigAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmAmmConfigAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmAmmConfigAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumClmmPoolStateAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmPoolStateAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmPoolStateAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumClmmTickArrayAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_clmm::RaydiumClmmTickArrayStateAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmTickArrayStateAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumCpmmConfigAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmAmmConfigAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmAmmConfigAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
             EventType::RaydiumCpmmPoolStateAccount => {
-                if let Ok(event) = bincode::deserialize::<solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmPoolStateAccountEvent>(data) {
+                if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmPoolStateAccountEvent>(data) {
                     return Ok(serde_json::to_value(event)?);
                 }
             },
@@ -1140,16 +1208,6 @@ impl StreamClientBuilder {
 
     pub fn auth_token(mut self, token: &str) -> Self {
         self.config.auth_token = Some(token.to_string());
-        self
-    }
-
-    pub fn protocol(mut self, protocol: SerializationProtocol) -> Self {
-        self.config.protocol = protocol;
-        self
-    }
-
-    pub fn compression(mut self, compression: CompressionLevel) -> Self {
-        self.config.compression = compression;
         self
     }
 

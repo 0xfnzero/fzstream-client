@@ -56,8 +56,6 @@ pub use client::{
     ClientStats,
     EventHandler,
     StatusHandler,
-    SDK_VERSION,
-    SDK_NAME,
 };
 
 pub use compression::{
@@ -70,16 +68,9 @@ pub use fzstream_common::{
     EventMessage,
     EventType,
     EventMetadata,
-    SolanaEventWrapper,
     TransactionEvent,
     AuthMessage,
     AuthResponse,
     SerializationProtocol,
     CompressionLevel,
-    CompressionType,
-    PerformanceProfile,
-    CustomSettings,
-    AutoOptimizationConfig,
-    ClientConfig,
-    ConfigBuilder,
 };
