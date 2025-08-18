@@ -465,62 +465,53 @@ impl FzStreamClient {
         
         // Start receiving events with comprehensive logging for UnifiedEvent callbacks
         tokio::spawn(async move {
-            info!("🔄 Starting UnifiedEvent receive loop...");
+            debug!("🔄 Starting UnifiedEvent receive loop...");
             let mut stream_counter = 0;
             
             loop {
                 tokio::select! {
                     _ = shutdown_rx.recv() => {
-                        info!("📡 UnifiedEvent stream shutdown requested");
+                        debug!("📡 UnifiedEvent stream shutdown requested");
                         break;
                     }
                     stream_result = connection.accept_uni() => {
                         stream_counter += 1;
-                        info!("📥 Incoming UnifiedEvent stream #{}: {:?}", stream_counter, stream_result);
+                        debug!("📥 Incoming UnifiedEvent stream #{}", stream_counter);
                         
                         match stream_result {
                             Ok(mut recv_stream) => {
-                                info!("✅ UnifiedEvent stream #{} accepted successfully", stream_counter);
                                 let mut buffer = Vec::new();
-                                let mut chunk = [0u8; 4096];
+                                let mut chunk = [0u8; 8192]; // 增加chunk大小
                                 let mut total_bytes_read = 0;
-                                let mut read_iterations = 0;
                                 
-                                // Read all data from stream
+                                // 读取所有数据
                                 loop {
-                                    read_iterations += 1;
-                                    debug!("🔍 UnifiedEvent reading iteration #{} from stream #{}", read_iterations, stream_counter);
-                                    
                                     match recv_stream.read(&mut chunk).await {
                                         Ok(Some(n)) => {
                                             total_bytes_read += n;
                                             buffer.extend_from_slice(&chunk[..n]);
-                                            info!("📦 UnifiedEvent read {} bytes in iteration #{} (total: {} bytes)", n, read_iterations, total_bytes_read);
                                         }
                                         Ok(None) => {
-                                            info!("🏁 UnifiedEvent stream #{} ended after {} iterations, total bytes: {}", stream_counter, read_iterations, total_bytes_read);
-                                            break; // Stream ended
-                            }
-                            Err(e) => {
-                                            error!("❌ Error reading from UnifiedEvent stream #{}: {}", stream_counter, e);
-                                break;
-                            }
-                        }
-                    }
+                                            debug!("🏁 Stream #{} ended, {} bytes", stream_counter, total_bytes_read);
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            error!("❌ Error reading from stream #{}: {}", stream_counter, e);
+                                            break;
+                                        }
+                                    }
+                                }
                                 
                                 if !buffer.is_empty() {
-                                    info!("🎯 Processing {} bytes from UnifiedEvent stream #{}", buffer.len(), stream_counter);
+                                    debug!("🎯 Processing {} bytes from stream #{}", buffer.len(), stream_counter);
                                     
-                                    // Log buffer content for debugging
-                                    debug!("📝 UnifiedEvent buffer content (first 100 bytes): {:?}", &buffer[..std::cmp::min(100, buffer.len())]);
-                                    
-                                    // Try to process the event and call callback with UnifiedEvent
+                                    // 处理事件并调用回调
                                     match Self::parse_event_data_as_unified(&buffer) {
                                         Ok(unified_event) => {
-                                            info!("✅ Successfully parsed UnifiedEvent from stream #{}: type={:?}, id={}", 
-                                                   stream_counter, unified_event.event_type(), unified_event.id());
+                                            debug!("✅ Parsed event: type={:?}, id={}", 
+                                                   unified_event.event_type(), unified_event.id());
                                             
-                                            // Update stats
+                                            // 批量更新统计
                                             {
                                                 let mut stats_guard = stats.write().await;
                                                 stats_guard.events_received += 1;
@@ -528,23 +519,21 @@ impl FzStreamClient {
                                                 stats_guard.last_event_time = Some(Instant::now());
                                             }
                                             
-                                            // Call the callback with UnifiedEvent
-                                            info!("🎭 Calling UnifiedEvent callback for event: {}", unified_event.id());
+                                            // 调用回调
                                             callback(unified_event);
                                         }
                                         Err(e) => {
-                                            error!("❌ Failed to parse UnifiedEvent data from stream #{}: {} (buffer size: {})", 
+                                            error!("❌ Failed to parse event from stream #{}: {} ({} bytes)", 
                                                    stream_counter, e, buffer.len());
-                                            debug!("🔍 Failed UnifiedEvent buffer hex dump: {}", hex::encode(&buffer[..std::cmp::min(200, buffer.len())]));
                                         }
                                     }
                                 } else {
-                                    warn!("⚠️ UnifiedEvent stream #{} ended with no data", stream_counter);
+                                    debug!("⚠️ Stream #{} ended with no data", stream_counter);
                                 }
                             }
                             Err(e) => {
-                                error!("❌ Error accepting UnifiedEvent stream #{}: {}", stream_counter, e);
-                                // Connection lost, trigger reconnection
+                                error!("❌ Error accepting stream #{}: {}", stream_counter, e);
+                                // 连接丢失，触发重连
                                 {
                                     let mut current_status = status.write().await;
                                     *current_status = ConnectionStatus::Disconnected;
@@ -556,7 +545,7 @@ impl FzStreamClient {
                 }
             }
             
-            info!("🔚 UnifiedEvent receive loop ended after processing {} streams", stream_counter);
+            debug!("🔚 UnifiedEvent receive loop ended after processing {} streams", stream_counter);
         });
         
         Ok(())
@@ -572,7 +561,7 @@ impl FzStreamClient {
         // 设置客户端处理开始时间
         event_message.set_client_processing_start();
         
-        info!("📥 Received self-describing UnifiedEvent: serialization={:?}, compression={:?}, compressed={}", 
+        debug!("📥 Received event: serialization={:?}, compression={:?}, compressed={}", 
               event_message.serialization_format, event_message.compression_format, event_message.is_compressed);
         
         // 使用 EventMessage 中的格式信息来解压缩数据
@@ -598,25 +587,9 @@ impl FzStreamClient {
         
         // 打印时间分析（只对有时间戳的事件）
         if result.is_ok() {
-            // 检查是否有时间戳信息
-            if event_message.grpc_arrival_time > 0 {
-                let server_time = event_message.server_total_time_ms();
-                let client_time = event_message.client_processing_time_ms().unwrap_or(0);
-                let end_to_end = event_message.end_to_end_time_ms().unwrap_or(0);
-                
-                info!("⏱️ Transaction Timing - Event: {} | Server: {}ms | Client: {}ms | Total: {}ms", 
-                      event_message.event_id, server_time, client_time, end_to_end);
-                
-                // 如果总耗时超过阈值，用警告级别打印
-                if end_to_end > 100 {
-                    warn!("🚨 High Latency Alert - Event: {} | Total Time: {}ms", 
-                          event_message.event_id, end_to_end);
-                }
-            } else {
-                // 对于没有时间戳的真实事件，只打印客户端处理时间
-                if let Some(client_time) = event_message.client_processing_time_ms() {
-                    info!("⏱️ Client Processing Time - Event: {} | Client: {}ms", 
-                          event_message.event_id, client_time);
+            if let Some(processing_time) = event_message.client_processing_time_ms() {
+                if processing_time > 1 {
+                    debug!("⏱️ Event processing time: {}ms", processing_time);
                 }
             }
         }
@@ -957,17 +930,37 @@ impl FzStreamClient {
 
     /// Configure QUIC client
     fn configure_quic_client(&self) -> Result<QuinnClientConfig> {
-        // For now, use a simple configuration - in production you should use proper certificates
+        // 使用简单的配置 - 在生产环境中应该使用proper证书
         let mut crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
             .with_no_client_auth();
 
-        // Set ALPN protocols to match server
+        // 设置ALPN协议以匹配服务器
         crypto.alpn_protocols = vec![b"h3".to_vec()];
 
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(crypto))?;
-        let client_config = QuinnClientConfig::new(Arc::new(quic_config));
+        let mut client_config = QuinnClientConfig::new(Arc::new(quic_config));
+        
+        // 配置QUIC传输参数
+        let mut transport_config = quinn::TransportConfig::default();
+        
+        // 更激进的RTT假设
+        transport_config.initial_rtt(Duration::from_millis(2));
+        
+        // 更大的流控制窗口
+        transport_config.stream_receive_window((128u32 * 1024 * 1024).into());
+        transport_config.receive_window((256u32 * 1024 * 1024).into());
+        
+        // 更高的并发流数量
+        transport_config.max_concurrent_bidi_streams(10000u32.into());
+        transport_config.max_concurrent_uni_streams(10000u32.into());
+        
+        // 更频繁的keep-alive
+        transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+        
+        // 应用传输配置
+        client_config.transport_config(Arc::new(transport_config));
         
         Ok(client_config)
     }
