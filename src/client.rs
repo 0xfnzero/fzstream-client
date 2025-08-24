@@ -7,6 +7,7 @@ use rustls::client::danger;
 use anyhow::Result;
 use log::{info, warn, error, debug};
 use serde_json;
+use bincode;
 
 use solana_streamer_sdk::streaming::event_parser::protocols::{
     bonk, pumpfun, pumpswap, raydium_amm_v4, raydium_clmm, raydium_cpmm, BlockMetaEvent
