@@ -13,7 +13,7 @@ use solana_streamer_sdk::streaming::event_parser::protocols::{
     bonk, pumpfun, pumpswap, raydium_amm_v4, raydium_clmm, raydium_cpmm, BlockMetaEvent
 };
 use solana_streamer_sdk::streaming::event_parser::core::UnifiedEvent;
-use fzstream_common::{SerializationProtocol, EventMessage, EventType, TransactionEvent, AuthMessage, AuthResponse};
+use fzstream_common::{SerializationProtocol, EventMessage, EventType, TransactionEvent, AuthMessage, AuthResponse, EventTypeFilter};
 
 /// Client connection status
 #[derive(Debug, Clone, PartialEq)]
@@ -98,6 +98,7 @@ pub struct FzStreamClient {
     reconnect_handle: Arc<AsyncMutex<Option<tokio::task::JoinHandle<()>>>>,
     current_reconnect_attempts: Arc<AsyncMutex<u32>>,
     is_streaming: Arc<AsyncMutex<bool>>,
+    event_filter: Arc<RwLock<Option<EventTypeFilter>>>,
 }
 
 impl FzStreamClient {
@@ -129,6 +130,7 @@ impl FzStreamClient {
             reconnect_handle: Arc::new(AsyncMutex::new(None)),
             current_reconnect_attempts: Arc::new(AsyncMutex::new(0)),
             is_streaming: Arc::new(AsyncMutex::new(false)),
+            event_filter: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -373,6 +375,11 @@ impl FzStreamClient {
             if let Some(connection) = &self.connection {
                 info!("🔐 Authenticating with server...");
                 
+                let event_filter = {
+                    let filter = self.event_filter.read().await;
+                    filter.clone()
+                };
+                
                 let auth_msg = AuthMessage {
                     auth_token: auth_token.clone(),
                     client_id: format!("client_{}", Uuid::new_v4()),
@@ -380,6 +387,7 @@ impl FzStreamClient {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_secs(),
+                    event_filter,
                 };
                 
                 let (mut send_stream, mut recv_stream) = connection.open_bi().await?;
@@ -403,8 +411,11 @@ impl FzStreamClient {
                 let auth_response: AuthResponse = serde_json::from_slice(&response_data)?;
                 
                 match auth_response {
-                    AuthResponse::Success { message, client_id, permissions } => {
+                    AuthResponse::Success { message, client_id, permissions, event_filter } => {
                         info!("✅ Authentication successful: {} (client_id: {}, permissions: {:?})", message, client_id, permissions);
+                        if let Some(filter) = &event_filter {
+                            info!("🎯 Server confirmed event filter: {}", filter.get_summary());
+                        }
                         self.set_status(ConnectionStatus::Authenticated).await;
                     },
                     AuthResponse::Failure { error, code } => {
@@ -1021,6 +1032,25 @@ impl danger::ServerCertVerifier for NoCertificateVerification {
 }
 
 impl FzStreamClient {
+    /// Subscribe to events with event filter
+    pub async fn subscribe_events_with_filter<F>(
+        &mut self,
+        event_filter: EventTypeFilter,
+        callback: F,
+    ) -> Result<()>
+    where
+        F: Fn(Box<dyn UnifiedEvent>) + Send + Sync + 'static + Clone,
+    {
+        // Store the event filter
+        {
+            let mut filter = self.event_filter.write().await;
+            *filter = Some(event_filter);
+        }
+        
+        // Use the regular subscribe_events method
+        self.subscribe_events(callback).await
+    }
+    
     /// Set connection status
     async fn set_status(&self, status: ConnectionStatus) {
         {

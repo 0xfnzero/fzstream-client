@@ -1,5 +1,5 @@
 // Configuration system for the Fast Stream Client SDK
-use serde::{Serialize, Deserialize};
+// use serde::{Serialize, Deserialize}; // Unused for now
 use std::collections::HashMap;
 use fzstream_common::{
     SerializationProtocol, 
