@@ -30,7 +30,7 @@ pub enum ConnectionStatus {
 /// Configuration for the stream client
 #[derive(Debug, Clone)]
 pub struct StreamClientConfig {
-    pub server_address: String,
+    pub endpoint: String,
     pub server_name: String,
     pub auth_token: Option<String>,
     pub auto_reconnect: bool,
@@ -45,7 +45,7 @@ pub struct StreamClientConfig {
 impl Default for StreamClientConfig {
     fn default() -> Self {
         Self {
-            server_address: "127.0.0.1:8080".to_string(),
+            endpoint: "127.0.0.1:8080".to_string(),
             server_name: "localhost".to_string(),
             auth_token: None,
             auto_reconnect: true,
@@ -109,12 +109,32 @@ impl FzStreamClient {
         Self::with_config(StreamClientConfig::default())
     }
 
+    /// Parse endpoint address and extract ip:port from URL if needed
+    fn parse_endpoint_address(address: &str) -> Result<String> {
+        // If address already looks like ip:port, use it directly
+        if !address.starts_with("http://") && !address.starts_with("https://") {
+            return Ok(address.to_string());
+        }
+
+        // Parse URL and extract host:port
+        let parsed_url = url::Url::parse(address)
+            .map_err(|e| anyhow::anyhow!("Invalid URL format: {}", e))?;
+        
+        let host = parsed_url.host_str()
+            .ok_or_else(|| anyhow::anyhow!("URL missing host"))?;
+        
+        let port = parsed_url.port_or_known_default()
+            .ok_or_else(|| anyhow::anyhow!("URL missing port and no default available"))?;
+        
+        Ok(format!("{}:{}", host, port))
+    }
+
     /// Create a new client with custom configuration
     pub fn with_config(config: StreamClientConfig) -> Self {
         // 自动设置 rustls 加密提供者
         Self::_install_crypto_provider();
         
-        info!("📋 Configuration: server={}", config.server_address);
+        info!("📋 Configuration: endpoint={}", config.endpoint);
         
         Self {
             config,
@@ -186,20 +206,23 @@ impl FzStreamClient {
 
     /// Connect to the server
     pub async fn connect(&mut self) -> Result<()> {
-        info!("🔗 Starting connection to server: {}", self.config.server_address);
+        info!("🔗 Starting connection to server: {}", self.config.endpoint);
         self.set_status(ConnectionStatus::Connecting).await;
         
         let client_config = self.configure_quic_client()?;
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
         endpoint.set_default_client_config(client_config);
         
-        let server_addr = self.config.server_address.parse()?;
+        // Parse endpoint address, supporting http/https URLs
+        let parsed_address = Self::parse_endpoint_address(&self.config.endpoint)?;
+        info!("📍 Parsed endpoint: {} -> {}", self.config.endpoint, parsed_address);
+        let server_addr = parsed_address.parse()?;
         let connection = tokio::time::timeout(
             self.config.connection_timeout,
             endpoint.connect(server_addr, &self.config.server_name)?
         ).await??;
 
-        info!("✅ Successfully connected to {}", self.config.server_address);
+        info!("✅ Successfully connected to {}", self.config.endpoint);
         
         self.endpoint = Some(endpoint);
         self.connection = Some(connection);
@@ -1077,8 +1100,8 @@ impl StreamClientBuilder {
         }
     }
 
-    pub fn server_address(mut self, address: &str) -> Self {
-        self.config.server_address = address.to_string();
+    pub fn endpoint(mut self, endpoint: &str) -> Self {
+        self.config.endpoint = endpoint.to_string();
         self
     }
 

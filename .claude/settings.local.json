@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/wangwei/Workspace/Solana-Dev/fast-grpc/**)",
+      "Bash(sed:*)",
+      "Bash(cargo check:*)",
+      "Read(//Users/wangwei/Workspace/Solana-Dev/fast-grpc/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

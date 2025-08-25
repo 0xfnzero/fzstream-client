@@ -20,7 +20,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let mut client = FastStreamClient::builder()
-//!         .server_address("127.0.0.1:8080")
+//!         .endpoint("127.0.0.1:8080")
 //!         .server_name("localhost")
 //!         .auth_token("your_auth_token")
 //!         .protocol(SerializationProtocol::Auto)
