@@ -13,6 +13,7 @@ use fzstream_common::{
 // 使用公共库中的类型定义，但创建一个包装类型来添加方法
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
+    #[allow(dead_code)]
     inner: CommonClientConfig,
 }
 
@@ -99,6 +100,7 @@ impl Default for ClientConfig {
 }
 
 impl ClientConfig {
+    #[allow(dead_code)]
     pub fn new(client_id: &str) -> Self {
         let mut config = Self::default();
         config.inner.client_id = client_id.to_string();
@@ -160,10 +162,12 @@ impl ClientConfig {
 }
 
 // Configuration builder for convenient custom configuration creation
+#[allow(dead_code)]
 pub struct ConfigBuilder {
     config: ClientConfig,
 }
 
+#[allow(dead_code)]
 impl ConfigBuilder {
     pub fn new(client_id: &str) -> Self {
         Self {
