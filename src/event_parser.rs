@@ -82,8 +82,16 @@ impl ClientEventParser {
         };
         
         // 发送到广播通道
-        if let Err(e) = self.event_sender.send(parsed_event.clone()) {
-            error!("❌ 发送解析事件到广播通道失败: {}", e);
+        match self.event_sender.send(parsed_event.clone()) {
+            Ok(receiver_count) => {
+                if receiver_count == 0 {
+                    debug!("📡 解析事件已发送，但无订阅者");
+                }
+            },
+            Err(_) => {
+                // 没有订阅者是正常情况
+                debug!("📡 没有订阅者接收解析事件（正常情况）");
+            }
         }
         
         // 调用注册的处理器
