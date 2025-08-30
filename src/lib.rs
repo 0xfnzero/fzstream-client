@@ -45,6 +45,7 @@
 mod config;
 mod compression;
 mod client;
+mod performance;
 
 // Re-export main types
 pub use client::{
@@ -60,6 +61,17 @@ pub use client::{
 pub use compression::{
     compress_data,
     decompress_data,
+};
+
+pub use performance::{
+    ClientPerformanceConfig,
+    ClientStats as PerformanceClientStats,
+    EventBuffer,
+    BatchProcessor,
+    ConnectionPool,
+    ReconnectionManager,
+    ClientPerformanceMonitor,
+    configure_client_endpoint,
 };
 
 // Re-export common types
