@@ -683,7 +683,7 @@ impl FzStreamClient {
         let event_message: EventMessage = bincode::deserialize(raw_data)?;
         
         // 预先分配解压缓冲区避免重新分配
-        let decompressed_data = if event_message.is_compressed {
+        let _decompressed_data = if event_message.is_compressed {
             event_message.get_decompressed_data()
                 .map_err(|e| anyhow::anyhow!("Decompression failed: {}", e))?
         } else {
@@ -691,24 +691,7 @@ impl FzStreamClient {
         };
         
         // 极速类型分支 - 使用match优化分支预测
-        let unified_event = match event_message.event_type {
-            EventType::Test => {
-                // 对于测试事件，快速JSON解析
-                if event_message.serialization_format == SerializationProtocol::JSON {
-                    let json_value: serde_json::Value = serde_json::from_slice(&decompressed_data)?;
-                    Box::new(TestEvent {
-                        event_id: event_message.event_id,
-                        data: json_value,
-                    }) as Box<dyn UnifiedEvent>
-                } else {
-                    return Err(anyhow::anyhow!("Unsupported serialization for test event"));
-                }
-            },
-            _ => {
-                // 其他事件类型的快速处理路径
-                return Self::parse_event_data_as_unified(raw_data);
-            }
-        };
+        let unified_event = Self::parse_event_data_as_unified(raw_data)?;
         
         Ok(unified_event)
     }
@@ -732,28 +715,34 @@ impl FzStreamClient {
         // 根据 EventMessage 中的序列化格式来解析
         let result = match event_message.serialization_format {
             SerializationProtocol::JSON => {
-                // 对于测试事件，支持JSON格式
-                if event_message.event_type == EventType::Test {
-                    if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&decompressed_data) {
-                        let test_event = TestEvent {
-                            event_id: event_message.event_id.clone(),
-                            data: json_value,
-                        };
-                        Ok(Box::new(test_event) as Box<dyn UnifiedEvent>)
-                    } else {
-                        Err(anyhow::anyhow!("Failed to parse JSON test event"))
-                    }
+                // 对于 JSON，尝试解析为 JSON 然后创建 TestEvent
+                if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&decompressed_data) {
+                    Ok(Box::new(TestEvent {
+                        event_id: event_message.event_id.clone(),
+                        data: json_value,
+                    }) as Box<dyn UnifiedEvent>)
                 } else {
-                    // 其他JSON事件不支持 UnifiedEvent 回调
-                    Err(anyhow::anyhow!("JSON events not supported for UnifiedEvent callback (except Test events)"))
+                    Err(anyhow::anyhow!("Failed to parse JSON data"))
                 }
             }
             SerializationProtocol::Bincode => {
                 Self::deserialize_solana_event_as_unified(&decompressed_data, &event_message.event_type)
             }
             SerializationProtocol::Auto => {
-                // 对于 Auto，尝试 bincode
-                Self::deserialize_solana_event_as_unified(&decompressed_data, &event_message.event_type)
+                // 对于 Auto，优先尝试 bincode，失败则尝试 JSON
+                match Self::deserialize_solana_event_as_unified(&decompressed_data, &event_message.event_type) {
+                    Ok(event) => Ok(event),
+                    Err(_) => {
+                        if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&decompressed_data) {
+                            Ok(Box::new(TestEvent {
+                                event_id: event_message.event_id.clone(),
+                                data: json_value,
+                            }) as Box<dyn UnifiedEvent>)
+                        } else {
+                            Err(anyhow::anyhow!("Failed to parse data as bincode or JSON"))
+                        }
+                    }
+                }
             }
         };
         
@@ -991,19 +980,6 @@ impl FzStreamClient {
             EventType::RaydiumCpmmPoolStateAccount => {
                 if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmPoolStateAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
-                }
-            },
-            EventType::Test => {
-                // Test events contain JSON data for debugging
-                if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(data) {
-                    // Create a simple test event wrapper
-                    return Ok(Box::new(TestEvent {
-                        event_id: format!("test_{}", std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis()),
-                        data: json_value,
-                    }) as Box<dyn UnifiedEvent>);
                 }
             },
             EventType::Custom(custom_type) => {

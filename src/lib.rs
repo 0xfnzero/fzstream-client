@@ -78,6 +78,7 @@ pub use performance::{
 pub use fzstream_common::{
     EventMessage,
     EventType,
+    EventTypeFilter,
     EventMetadata,
     TransactionEvent,
     AuthMessage,
