@@ -470,7 +470,7 @@ impl FzStreamClient {
     }
 
     /// Subscribe to events with a callback function that receives UnifiedEvent
-    pub async fn subscribe_events<F>(
+    pub async fn subscribe<F>(
         &mut self,
         callback: F,
     ) -> Result<()>
@@ -1193,8 +1193,8 @@ impl danger::ServerCertVerifier for NoCertificateVerification {
 }
 
 impl FzStreamClient {
-    /// Subscribe to events with event filter
-    pub async fn subscribe_events_with_filter<F>(
+    /// Subscribe to events with event filter and handle Ctrl+C
+    pub async fn subscribe_with_filter<F>(
         &mut self,
         event_filter: EventTypeFilter,
         callback: F,
@@ -1208,8 +1208,39 @@ impl FzStreamClient {
             *filter = Some(event_filter);
         }
         
-        // Use the regular subscribe_events method
-        self.subscribe_events(callback).await
+        // Start subscription
+        self.subscribe(callback.clone()).await?;
+        
+        // Create a handle that keeps the process alive
+        let mut handle = tokio::spawn(async move {
+            // Keep the subscription alive until cancelled
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            }
+        });
+
+        // Setup Ctrl+C handler
+        let shutdown = tokio::signal::ctrl_c();
+        
+        // Wait for either Ctrl+C or subscription to end
+        tokio::select! {
+            _ = shutdown => {
+                info!("⚠️  Received Ctrl+C signal, shutting down...");
+                handle.abort();
+            }
+            result = &mut handle => {
+                match result {
+                    Ok(_) => info!("✅ Subscription ended normally"),
+                    Err(e) if e.is_cancelled() => info!("ℹ️  Subscription was cancelled"),
+                    Err(e) => error!("❌ Subscription error: {}", e),
+                }
+            }
+        }
+        
+        // Perform graceful shutdown
+        self.shutdown().await?;
+        
+        Ok(())
     }
     
     /// Set connection status

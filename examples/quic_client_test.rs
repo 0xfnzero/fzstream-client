@@ -1,6 +1,4 @@
 use std::time::Duration;
-use std::sync::Arc;
-use tokio::time::sleep;
 use anyhow::Result;
 use fzstream_client::FzStreamClient;
 use fzstream_common::EventTypeFilter;
@@ -16,24 +14,18 @@ async fn main() -> Result<()> {
     // 设置日志
     env_logger::init();
             
-    // 连接到QUIC服务器的参数（不需要http://前缀）
-    let server_addr = "127.0.0.1:2222"; 
+    let server_addr = "http://127.0.0.1:2222"; 
     let auth_token = "demo_token_12345";   
 
-    let client = Arc::new(tokio::sync::Mutex::new(
-        FzStreamClient::builder()
-            .server_address(&server_addr)
-            .auth_token(auth_token)
-            .connection_timeout(Duration::from_secs(5))  // 设置合理的连接超时
-            .build()
-            .expect("Failed to create client")
-    ));
+    let mut client = FzStreamClient::builder()
+        .server_address(&server_addr)
+        .auth_token(auth_token)
+        .connection_timeout(Duration::from_secs(5))
+        .build()
+        .expect("Failed to create client");
     
     println!("🔗 连接到服务器...");
-    {
-        let mut client_guard = client.lock().await;
-        client_guard.connect().await?;
-    }
+    client.connect().await?;
     println!("✅ 客户端已连接");
     
     // 设置事件过滤器
@@ -43,57 +35,11 @@ async fn main() -> Result<()> {
     
     println!("📡 开始订阅事件...");
     println!("🎯 设置事件过滤器为: {}", event_filter.get_summary());
-    
-    // 使用 subscribe_events_with_filter 方法接收事件
-    let client_clone = Arc::clone(&client);
-    let _client_handle = tokio::spawn(async move {          
-        let mut client_guard = client_clone.lock().await;
-        println!("🔄 开始订阅事件流...");
-        match client_guard.subscribe_events_with_filter(event_filter, create_event_callback()).await {
-            Ok(_) => {
-                println!("✅ 订阅成功完成");
-            }
-            Err(e) => {
-                eprintln!("❌ 客户端订阅事件失败: {}", e);
-                eprintln!("   错误详情: {:?}", e);
-            }
-        }
-        drop(client_guard);  // 释放锁
-        
-        println!("⚠️ subscribe_events_with_filter 已返回，保持任务运行...");
-        
-        // 保持连接活跃
-        loop {
-            sleep(Duration::from_millis(100)).await;
-        }
-    });
-    
-    // 给外部服务器一些时间来处理连接
-    println!("⏳ 等待与外部服务器建立稳定连接...");
-    sleep(Duration::from_millis(2000)).await;
-    
-    // 设置信号处理器来优雅地处理 Ctrl+C
-    let shutdown = tokio::signal::ctrl_c();
     println!("📡 开始接收事件流... (按 Ctrl+C 停止)");
     println!("─────────────────────────────────────────────");
     
-    // 等待 Ctrl+C 信号或客户端错误
-    tokio::select! {
-        _ = shutdown => {
-            println!("\n─────────────────────────────────────────────");
-            println!("⚠️  接收到 Ctrl+C，正在停止...");
-        }
-        _ = _client_handle => {
-            println!("\n❌ 客户端连接意外中断");
-        }
-    }
-    
-    // 正确关闭连接
-    println!("🔌 正在关闭连接...");
-    {
-        let mut client_guard = client.lock().await;
-        client_guard.disconnect().await;
-    }
+    // 使用内置的Ctrl+C处理 - 自动处理shutdown
+    client.subscribe_with_filter(event_filter, create_event_callback()).await?;
     
     println!("✅ 程序已正常退出");
     Ok(())
