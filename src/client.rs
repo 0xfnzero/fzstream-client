@@ -12,67 +12,8 @@ use bincode;
 use solana_streamer_sdk::streaming::event_parser::protocols::{
     bonk, pumpfun, pumpswap, raydium_amm_v4, raydium_clmm, raydium_cpmm, BlockMetaEvent
 };
-use solana_streamer_sdk::streaming::event_parser::core::UnifiedEvent;
-use solana_streamer_sdk::streaming::event_parser::common::{EventType as SolanaEventType, TransferData, SwapData};
-use std::any::Any;
-use fzstream_common::{SerializationProtocol, EventMessage, EventType, TransactionEvent, AuthMessage, AuthResponse, EventTypeFilter};
-
-/// Test event for debugging and system testing
-#[derive(Debug, Clone)]
-pub struct TestEvent {
-    pub event_id: String,
-    pub data: serde_json::Value,
-}
-
-impl UnifiedEvent for TestEvent {
-    fn id(&self) -> &str {
-        &self.event_id
-    }
-    
-    fn event_type(&self) -> SolanaEventType {
-        SolanaEventType::BlockMeta // Use an existing variant for test events
-    }
-    
-    fn signature(&self) -> &str {
-        "test_signature"
-    }
-    
-    fn slot(&self) -> u64 {
-        0
-    }
-    
-    fn program_received_time_ms(&self) -> i64 {
-        0
-    }
-    
-    fn program_handle_time_consuming_ms(&self) -> i64 {
-        0
-    }
-    
-    fn set_program_handle_time_consuming_ms(&mut self, _: i64) {
-        // No-op for test events
-    }
-    
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-    
-    fn clone_boxed(&self) -> Box<dyn UnifiedEvent> {
-        Box::new(self.clone())
-    }
-    
-    fn set_transfer_datas(&mut self, _: Vec<TransferData>, _: Option<SwapData>) {
-        // No-op for test events
-    }
-    
-    fn index(&self) -> String {
-        self.event_id.clone()
-    }
-}
+use solana_streamer_sdk::streaming::event_parser::UnifiedEvent;
+use fzstream_common::{SerializationProtocol, EventMessage, TransactionEvent, AuthMessage, AuthResponse, EventType, EventTypeFilter};
 
 /// Client connection status
 #[derive(Debug, Clone, PartialEq)]
@@ -571,32 +512,44 @@ impl FzStreamClient {
         
         // Start receiving events with comprehensive logging for UnifiedEvent callbacks
         tokio::spawn(async move {
-            debug!("🔄 Starting UnifiedEvent receive loop...");
+            info!("🔄 *** STARTING UNIFIED EVENT RECEIVE LOOP WITH ULTRA DEBUGGING ***");
+            info!("🔗 Connection state: {:?}", connection.remote_address());
             let mut stream_counter = 0;
+            let loop_start_time = std::time::Instant::now();
             
             loop {
                 tokio::select! {
                     _ = shutdown_rx.recv() => {
-                        debug!("📡 UnifiedEvent stream shutdown requested");
+                        warn!("📡 UnifiedEvent stream shutdown requested");
                         break;
                     }
                     stream_result = connection.accept_uni() => {
                         stream_counter += 1;
-                        info!("📥 Incoming UnifiedEvent stream #{}", stream_counter);
+                        info!("📥 *** INCOMING STREAM #{} *** - 运行时间: {:?}", stream_counter, loop_start_time.elapsed());
+                        info!("🔍 accept_uni() 成功返回结果");
                         
                         match stream_result {
                             Ok(mut recv_stream) => {
+                                info!("✅ Stream #{} 创建成功 - 开始读取数据", stream_counter);
+                                
                                 // 🚀 极致零延迟缓冲区 - 超大预分配减少内存操作
                                 let mut buffer: Vec<u8> = Vec::with_capacity(1048576); // 1MB预分配
                                 let mut chunk = [0u8; 131072]; // 128KB超大块读取 - 减少read调用
                                 let mut total_bytes_read = 0;
                                 let start_time = Instant::now();
+                                let mut read_attempts = 0;
+                                
+                                info!("🚀 开始读取数据循环 - Stream #{}", stream_counter);
                                 
                                 // 高速读取所有数据 - 零延迟模式
                                 loop {
+                                    read_attempts += 1;
+                                    info!("📖 读取尝试 #{} - Stream #{}", read_attempts, stream_counter);
+                                    
                                     match recv_stream.read(&mut chunk).await {
                                         Ok(Some(n)) => {
                                             total_bytes_read += n;
+                                            info!("📦 读取到 {} 字节数据 (总计: {} 字节) - Stream #{}", n, total_bytes_read, stream_counter);
                                             // 使用unsafe直接操作内存避免边界检查
                                             unsafe {
                                                 let old_len = buffer.len();
@@ -610,24 +563,29 @@ impl FzStreamClient {
                                         }
                                         Ok(None) => {
                                             let read_duration = start_time.elapsed();
-                                            debug!("⚡ Stream #{} completed: {} bytes in {:?}", 
-                                                  stream_counter, total_bytes_read, read_duration);
+                                            info!("⚡ Stream #{} READ COMPLETED: {} bytes in {:?} (attempts: {})", 
+                                                  stream_counter, total_bytes_read, read_duration, read_attempts);
                                             break;
                                         }
                                         Err(e) => {
-                                            error!("❌ Read error stream #{}: {}", stream_counter, e);
+                                            error!("❌ READ ERROR stream #{}: {} (attempts: {})", stream_counter, e, read_attempts);
                                             break;
                                         }
                                     }
                                 }
                                 
                                 if !buffer.is_empty() {
+                                    info!("📥 *** 客户端接收到数据: {} 字节 *** - Stream #{}", buffer.len(), stream_counter);
+                                    info!("🔍 原始数据前100字节: {:02x?}", &buffer[..std::cmp::min(buffer.len(), 100)]);
                                     let processing_start = Instant::now();
+                                    
+                                    info!("🚀 开始解析事件数据 - Stream #{}", stream_counter);
                                     
                                     // 超高速事件解析 - 零拷贝模式
                                     match Self::parse_event_data_ultra_fast(&buffer) {
                                         Ok(unified_event) => {
                                             let parse_duration = processing_start.elapsed();
+                                            info!("✅ *** 解析成功 *** Stream #{}: {:?} - {}", stream_counter, unified_event.event_type(), unified_event.signature());
                                             
                                             // 无锁统计更新 - 使用原子操作避免锁竞争
                                             if let Ok(mut stats_guard) = stats.try_write() {
@@ -636,26 +594,40 @@ impl FzStreamClient {
                                                 stats_guard.last_event_time = Some(Instant::now());
                                             }
                                             
+                                            info!("🎯 准备执行回调函数 - Stream #{}", stream_counter);
+                                            
                                             // 极速回调执行 - 直接调用避免额外分配
                                             let callback_start = Instant::now();
                                             callback(unified_event);
                                             let callback_duration = callback_start.elapsed();
                                             
+                                            info!("✅ *** 回调执行完成 *** Stream #{} - 耗时: {:?}", stream_counter, callback_duration);
+                                            
                                             let total_duration = processing_start.elapsed();
-                                            debug!("⚡ Event processed: parse={:?}, callback={:?}, total={:?}", 
+                                            info!("⚡ Event processed: parse={:?}, callback={:?}, total={:?}", 
                                                   parse_duration, callback_duration, total_duration);
                                         }
                                         Err(e) => {
-                                            error!("❌ Parse failed stream #{}: {} ({} bytes)", 
-                                                   stream_counter, e, buffer.len());
+                                            let error_msg = format!("{}", e);
+                                            if error_msg.contains("heartbeat message") || 
+                                               error_msg.contains("JSON message") ||
+                                               error_msg.contains("auth response") || 
+                                               error_msg.contains("auth message") {
+                                                info!("⚠️ 跳过非事件消息 stream #{}: {}", stream_counter, error_msg);
+                                            } else {
+                                                error!("❌ *** 解析失败 *** stream #{}: {} ({} bytes)", 
+                                                       stream_counter, e, buffer.len());
+                                                error!("🔍 解析失败的数据前200字节: {:02x?}", &buffer[..std::cmp::min(buffer.len(), 200)]);
+                                            }
                                         }
                                     }
                                 } else {
-                                    debug!("⚠️ Empty stream #{}", stream_counter);
+                                    info!("⚠️ Empty stream #{} - 没有数据", stream_counter);
                                 }
                             }
                             Err(e) => {
-                                error!("❌ Error accepting stream #{}: {}", stream_counter, e);
+                                error!("❌ *** accept_uni() 失败 *** stream #{}: {}", stream_counter, e);
+                                error!("🔍 连接状态检查: 远程地址 = {:?}", connection.remote_address());
                                 // 连接丢失，触发重连
                                 {
                                     let mut current_status = status.write().await;
@@ -666,9 +638,16 @@ impl FzStreamClient {
                         }
                     }
                 }
+                
+                // 定期输出状态信息
+                if stream_counter % 10 == 0 && stream_counter > 0 {
+                    info!("📊 状态报告: 已处理 {} 个流, 运行时间: {:?}", stream_counter, loop_start_time.elapsed());
+                } else if stream_counter == 0 && loop_start_time.elapsed().as_secs() > 5 {
+                    warn!("⚠️ 警告: 5秒内没有接收到任何流!");
+                }
             }
             
-            debug!("🔚 UnifiedEvent receive loop ended after processing {} streams", stream_counter);
+            error!("🔚 *** UNIFIED EVENT RECEIVE LOOP ENDED *** 总共处理了 {} 个流", stream_counter);
         });
         
         Ok(())
@@ -679,8 +658,54 @@ impl FzStreamClient {
     fn parse_event_data_ultra_fast(
         raw_data: &[u8],
     ) -> Result<Box<dyn UnifiedEvent>> {
-        // 使用原地反序列化避免额外分配
-        let event_message: EventMessage = bincode::deserialize(raw_data)?;
+        // 调试: 输出原始数据来诊断问题
+        if raw_data.len() <= 50 {
+            warn!("🔍 Received small data packet ({} bytes): {:02x?}", raw_data.len(), raw_data);
+            if let Ok(s) = std::str::from_utf8(raw_data) {
+                warn!("🔍 As string: '{}'", s);
+            }
+        }
+        
+        // 检查是否是JSON格式的消息（心跳包等）
+        if raw_data.len() > 0 && raw_data[0] == b'{' {
+            if let Ok(json_str) = std::str::from_utf8(raw_data) {
+                debug!("💓 Received JSON message: {}", json_str);
+                
+                // 尝试解析JSON来确定消息类型
+                if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(msg_type) = json_value.get("msg").and_then(|v| v.as_str()) {
+                        match msg_type {
+                            "heartbeat" => {
+                                debug!("💓 Heartbeat received, skipping");
+                                return Err(anyhow::anyhow!("Received heartbeat message, not an event"));
+                            },
+                            _ => {
+                                debug!("📨 Unknown JSON message type: {}", msg_type);
+                            }
+                        }
+                    }
+                }
+                return Err(anyhow::anyhow!("Received JSON message, not a bincode EventMessage"));
+            }
+        }
+        
+        // 尝试反序列化为AuthResponse（认证响应）
+        if let Ok(auth_response) = bincode::deserialize::<AuthResponse>(raw_data) {
+            debug!("📨 Received auth response: {:?}", auth_response);
+            return Err(anyhow::anyhow!("Received auth response, not an event"));
+        }
+        
+        // 尝试反序列化为AuthMessage（认证消息）
+        if let Ok(auth_message) = bincode::deserialize::<AuthMessage>(raw_data) {
+            debug!("🔐 Received auth message: {:?}", auth_message);
+            return Err(anyhow::anyhow!("Received auth message, not an event"));
+        }
+        
+        // 使用原地反序列化EventMessage
+        let event_message: EventMessage = bincode::deserialize(raw_data)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize EventMessage from {} bytes: {} (data: {:02x?})", 
+                                      raw_data.len(), e, 
+                                      if raw_data.len() <= 20 { raw_data } else { &raw_data[..20] }))?;
         
         // 预先分配解压缓冲区避免重新分配
         let _decompressed_data = if event_message.is_compressed {
@@ -715,34 +740,13 @@ impl FzStreamClient {
         // 根据 EventMessage 中的序列化格式来解析
         let result = match event_message.serialization_format {
             SerializationProtocol::JSON => {
-                // 对于 JSON，尝试解析为 JSON 然后创建 TestEvent
-                if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&decompressed_data) {
-                    Ok(Box::new(TestEvent {
-                        event_id: event_message.event_id.clone(),
-                        data: json_value,
-                    }) as Box<dyn UnifiedEvent>)
-                } else {
-                    Err(anyhow::anyhow!("Failed to parse JSON data"))
-                }
+                Err(anyhow::anyhow!("JSON events not supported for UnifiedEvent callback"))
             }
             SerializationProtocol::Bincode => {
                 Self::deserialize_solana_event_as_unified(&decompressed_data, &event_message.event_type)
             }
             SerializationProtocol::Auto => {
-                // 对于 Auto，优先尝试 bincode，失败则尝试 JSON
-                match Self::deserialize_solana_event_as_unified(&decompressed_data, &event_message.event_type) {
-                    Ok(event) => Ok(event),
-                    Err(_) => {
-                        if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&decompressed_data) {
-                            Ok(Box::new(TestEvent {
-                                event_id: event_message.event_id.clone(),
-                                data: json_value,
-                            }) as Box<dyn UnifiedEvent>)
-                        } else {
-                            Err(anyhow::anyhow!("Failed to parse data as bincode or JSON"))
-                        }
-                    }
-                }
+                Self::deserialize_solana_event_as_unified(&decompressed_data, &event_message.event_type)
             }
         };
         
@@ -761,24 +765,38 @@ impl FzStreamClient {
         result
     }
 
-    /// Deserialize Solana event from bincode data as UnifiedEvent
     fn deserialize_solana_event_as_unified(data: &[u8], event_type: &EventType) -> Result<Box<dyn UnifiedEvent>> {
         info!("🔍 Attempting to deserialize {:?} event with {} bytes", event_type, data.len());
         
-        // Try to deserialize as the specific Solana event type
+        // Try to deserialize as the specific Solana event type based on EventType
         match event_type {
             EventType::BlockMeta => {
                 if let Ok(event) = bincode::deserialize::<BlockMetaEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::BonkPoolCreate => {
-                if let Ok(event) = bincode::deserialize::<bonk::BonkPoolCreateEvent>(data) {
+            EventType::PumpFunBuy | EventType::PumpFunSell => {
+                if let Ok(event) = bincode::deserialize::<pumpfun::PumpFunTradeEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::BonkTrade => {
+            EventType::PumpFunMigrate => {
+                if let Ok(event) = bincode::deserialize::<pumpfun::PumpFunMigrateEvent>(data) {
+                    return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
+                }
+            },
+            EventType::PumpFunCreateToken => {
+                if let Ok(event) = bincode::deserialize::<pumpfun::PumpFunCreateTokenEvent>(data) {
+                    return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
+                }
+            },
+            EventType::BonkBuyExactIn | EventType::BonkBuyExactOut | EventType::BonkSellExactIn | EventType::BonkSellExactOut => {
                 if let Ok(event) = bincode::deserialize::<bonk::BonkTradeEvent>(data) {
+                    return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
+                }
+            },
+            EventType::BonkInitialize | EventType::BonkInitializeV2 => {
+                if let Ok(event) = bincode::deserialize::<bonk::BonkPoolCreateEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
@@ -792,21 +810,6 @@ impl FzStreamClient {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::PumpFunTrade => {
-                if let Ok(event) = bincode::deserialize::<pumpfun::PumpFunTradeEvent>(data) {
-                    return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
-                }
-            },
-            EventType::PumpFunMigrate => {
-                if let Ok(event) = bincode::deserialize::<pumpfun::PumpFunMigrateEvent>(data) {
-                    return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
-                }
-            },
-            EventType::PumpFunCreate => {
-                if let Ok(event) = bincode::deserialize::<pumpfun::PumpFunCreateTokenEvent>(data) {
-                    return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
-                }
-            },
             EventType::PumpSwapBuy => {
                 if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapBuyEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
@@ -817,7 +820,7 @@ impl FzStreamClient {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::PumpSwapCreate => {
+            EventType::PumpSwapCreatePool => {
                 if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapCreatePoolEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
@@ -832,7 +835,7 @@ impl FzStreamClient {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::RaydiumCpmmSwap => {
+            EventType::RaydiumCpmmSwapBaseInput | EventType::RaydiumCpmmSwapBaseOutput => {
                 if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmSwapEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
@@ -892,7 +895,7 @@ impl FzStreamClient {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::RaydiumAmmV4Swap => {
+            EventType::RaydiumAmmV4SwapBaseIn | EventType::RaydiumAmmV4SwapBaseOut => {
                 if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4SwapEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
@@ -902,7 +905,7 @@ impl FzStreamClient {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::RaydiumAmmV4Initialize => {
+            EventType::RaydiumAmmV4Initialize2 => {
                 if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4Initialize2Event>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
@@ -917,76 +920,77 @@ impl FzStreamClient {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::BonkPoolStateAccount => {
+            EventType::AccountBonkPoolState => {
                 if let Ok(event) = bincode::deserialize::<bonk::BonkPoolStateAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::BonkGlobalConfigAccount => {
+            EventType::AccountBonkGlobalConfig => {
                 if let Ok(event) = bincode::deserialize::<bonk::BonkGlobalConfigAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::BonkPlatformConfigAccount => {
+            EventType::AccountBonkPlatformConfig => {
                 if let Ok(event) = bincode::deserialize::<bonk::BonkPlatformConfigAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::PumpSwapGlobalConfigAccount => {
+            EventType::AccountPumpSwapGlobalConfig => {
                 if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapGlobalConfigAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::PumpSwapPoolAccount => {
+            EventType::AccountPumpSwapPool => {
                 if let Ok(event) = bincode::deserialize::<pumpswap::PumpSwapPoolAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::PumpFunBondingCurveAccount => {
+            EventType::AccountPumpFunBondingCurve => {
                 if let Ok(event) = bincode::deserialize::<pumpfun::PumpFunBondingCurveAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::PumpFunGlobalAccount => {
+            EventType::AccountPumpFunGlobal => {
                 if let Ok(event) = bincode::deserialize::<pumpfun::PumpFunGlobalAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::RaydiumAmmV4InfoAccount => {
+            EventType::AccountRaydiumAmmV4AmmInfo => {
                 if let Ok(event) = bincode::deserialize::<raydium_amm_v4::RaydiumAmmV4AmmInfoAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::RaydiumClmmConfigAccount => {
+            EventType::AccountRaydiumClmmAmmConfig => {
                 if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmAmmConfigAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::RaydiumClmmPoolStateAccount => {
+            EventType::AccountRaydiumClmmPoolState => {
                 if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmPoolStateAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::RaydiumClmmTickArrayAccount => {
+            EventType::AccountRaydiumClmmTickArrayState => {
                 if let Ok(event) = bincode::deserialize::<raydium_clmm::RaydiumClmmTickArrayStateAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::RaydiumCpmmConfigAccount => {
+            EventType::AccountRaydiumCpmmAmmConfig => {
                 if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmAmmConfigAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::RaydiumCpmmPoolStateAccount => {
+            EventType::AccountRaydiumCpmmPoolState => {
                 if let Ok(event) = bincode::deserialize::<raydium_cpmm::RaydiumCpmmPoolStateAccountEvent>(data) {
                     return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
                 }
             },
-            EventType::Custom(custom_type) => {
-                // For custom events, we can't deserialize to a specific type
-                // Return an error or handle as needed
-                return Err(anyhow::anyhow!("Custom event type '{}' not supported for UnifiedEvent deserialization", custom_type));
-            },
+            _ => {
+                // For unknown events, try to deserialize as BlockMetaEvent as fallback
+                if let Ok(event) = bincode::deserialize::<BlockMetaEvent>(data) {
+                    return Ok(Box::new(event) as Box<dyn UnifiedEvent>);
+                }
+            }
         }
         
         Err(anyhow::anyhow!("Failed to deserialize event for type: {:?}", event_type))

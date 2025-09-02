@@ -99,8 +99,8 @@ impl Default for ClientConfig {
     }
 }
 
+#[allow(dead_code)]
 impl ClientConfig {
-    #[allow(dead_code)]
     pub fn new(client_id: &str) -> Self {
         let mut config = Self::default();
         config.inner.client_id = client_id.to_string();
