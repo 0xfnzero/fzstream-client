@@ -1,53 +1,66 @@
 use std::time::Duration;
+use std::sync::Arc;
 use tokio::time::sleep;
-use fzstream_common::{EventMessage, EventType, SerializationProtocol, CompressionLevel};
-use fzstream_client::{FzStreamClient, StreamClientConfig};
-use fzstream_server::{create_server, ServerConfig};
-use solana_streamer_sdk::streaming::event_parser::core::UnifiedEvent;
+use anyhow::Result;
+use fzstream_client::FzStreamClient;
+use fzstream_common::EventTypeFilter;
+use solana_streamer_sdk::streaming::event_parser::UnifiedEvent;
+use solana_streamer_sdk::streaming::event_parser::common::EventType;
 use solana_streamer_sdk::streaming::event_parser::protocols::{
-    bonk, pumpfun, pumpswap, raydium_amm_v4, raydium_clmm, raydium_cpmm, BlockMetaEvent
+    bonk::*, pumpfun::*, pumpswap::*, raydium_amm_v4::*, raydium_clmm::*, raydium_cpmm::*, BlockMetaEvent
 };
-use serde::{Serialize, Deserialize};
 use solana_streamer_sdk::match_event;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<()> {
     // 设置日志
     env_logger::init();
-    
-    println!("🚀 开始基本 QUIC 连接测试...");
-    
-    // 启动 QUIC 服务器
-    let server_addr = "127.0.0.1:2222";
-    // 创建并启动客户端
-    println!("🔌 创建 QUIC 客户端...");
-    // let mut config = StreamClientConfig::default();
-    // config.auth_token = Some("demo_token_12345".to_string()); // 添加测试认证令牌
-    // config.endpoint = server_addr.to_string();
+            
+    // 连接到QUIC服务器的参数（不需要http://前缀）
+    let server_addr = "127.0.0.1:2222"; 
+    let auth_token = "demo_token_12345";   
 
-    let mut client = FzStreamClient::builder()
-    .server_address(&server_addr)
-    .auth_token("demo_token_12345")
-    .ultra_low_latency_mode(true)
-    .build()
-    .expect("Failed to create client");
+    let client = Arc::new(tokio::sync::Mutex::new(
+        FzStreamClient::builder()
+            .server_address(&server_addr)
+            .auth_token(auth_token)
+            .connection_timeout(Duration::from_secs(5))  // 设置合理的连接超时
+            .build()
+            .expect("Failed to create client")
+    ));
     
-    // let mut client = FzStreamClient::with_config(config);
-    
-    // 连接到服务器
     println!("🔗 连接到服务器...");
-    client.connect().await?;
+    {
+        let mut client_guard = client.lock().await;
+        client_guard.connect().await?;
+    }
     println!("✅ 客户端已连接");
     
-    // 使用 subscribe_events 方法接收事件
-    println!("📡 开始订阅事件...");
-    let event_received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let event_received_clone = event_received.clone();
+    // 设置事件过滤器
+    let event_filter = EventTypeFilter::allow_only(vec![
+        EventType::BlockMeta,
+    ]);
     
-    let client_handle = tokio::spawn(async move {
-        if let Err(e) = client.subscribe_events(create_event_callback(event_received_clone)).await {
-            eprintln!("❌ 客户端订阅事件失败: {}", e);
+    println!("📡 开始订阅事件...");
+    println!("🎯 设置事件过滤器为: {}", event_filter.get_summary());
+    
+    // 使用 subscribe_events_with_filter 方法接收事件
+    let client_clone = Arc::clone(&client);
+    let _client_handle = tokio::spawn(async move {          
+        let mut client_guard = client_clone.lock().await;
+        println!("🔄 开始订阅事件流...");
+        match client_guard.subscribe_events_with_filter(event_filter, create_event_callback()).await {
+            Ok(_) => {
+                println!("✅ 订阅成功完成");
+            }
+            Err(e) => {
+                eprintln!("❌ 客户端订阅事件失败: {}", e);
+                eprintln!("   错误详情: {:?}", e);
+            }
         }
+        drop(client_guard);  // 释放锁
+        
+        println!("⚠️ subscribe_events_with_filter 已返回，保持任务运行...");
         
         // 保持连接活跃
         loop {
@@ -55,37 +68,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
     
-    // // 等待事件被接收
-    // println!("⏳ 等待事件接收...");
-    // let mut attempts = 0;
-    // while !event_received.load(std::sync::atomic::Ordering::Relaxed) && attempts < 30 {
-    //     sleep(Duration::from_millis(1000)).await;
-    //     attempts += 1;
-    //     println!("等待中... ({}/30)", attempts);
-    // }
+    // 给外部服务器一些时间来处理连接
+    println!("⏳ 等待与外部服务器建立稳定连接...");
+    sleep(Duration::from_millis(2000)).await;
     
-    // if event_received.load(std::sync::atomic::Ordering::Relaxed) {
-    //     println!("🎉 测试成功! 客户端成功接收到事件数据!");
-    // } else {
-    //     println!("❌ 测试失败! 客户端未能接收到事件数据");
-    //     println!("💡 这可能是因为服务器和客户端之间的 QUIC 连接还没有完全建立");
-    //     println!("💡 或者事件广播机制还没有实现");
-    // }
+    // 设置信号处理器来优雅地处理 Ctrl+C
+    let shutdown = tokio::signal::ctrl_c();
+    println!("📡 开始接收事件流... (按 Ctrl+C 停止)");
+    println!("─────────────────────────────────────────────");
     
-    // // 清理
-    // println!("🛑 清理资源...");
-    // client_handle.abort();
-    // // server_handle.abort();
+    // 等待 Ctrl+C 信号或客户端错误
+    tokio::select! {
+        _ = shutdown => {
+            println!("\n─────────────────────────────────────────────");
+            println!("⚠️  接收到 Ctrl+C，正在停止...");
+        }
+        _ = _client_handle => {
+            println!("\n❌ 客户端连接意外中断");
+        }
+    }
     
-    println!("✅ 测试完成!");
+    // 正确关闭连接
+    println!("🔌 正在关闭连接...");
+    {
+        let mut client_guard = client.lock().await;
+        client_guard.disconnect().await;
+    }
+    
+    println!("✅ 程序已正常退出");
     Ok(())
 }
 
-fn create_event_callback(event_received: std::sync::Arc<std::sync::atomic::AtomicBool>) -> impl Fn(Box<dyn UnifiedEvent>) + Clone {
-    let event_received = event_received.clone();
+fn create_event_callback() -> impl Fn(Box<dyn UnifiedEvent>) + Clone {
     move |event: Box<dyn UnifiedEvent>| {
         println!("🎉 Event received! Type: {:?}, Signature: {}", event.event_type(), event.signature());
-        event_received.store(true, std::sync::atomic::Ordering::Relaxed);
         
         match_event!(event, {
             // -------------------------- block meta -----------------------
@@ -93,138 +109,138 @@ fn create_event_callback(event_received: std::sync::Arc<std::sync::atomic::Atomi
                 println!("BlockMetaEvent: {e:?}");
             },
             // -------------------------- bonk -----------------------
-            BonkPoolCreateEvent => |e: bonk::BonkPoolCreateEvent| {
+            BonkPoolCreateEvent => |e: BonkPoolCreateEvent| {
                 // When using grpc, you can get block_time from each event
                 println!("block_time: {:?}, block_time_ms: {:?}", e.metadata.block_time, e.metadata.block_time_ms);
                 println!("BonkPoolCreateEvent: {:?}", e.base_mint_param.symbol);
             },
-            BonkTradeEvent => |e: bonk::BonkTradeEvent| {
+            BonkTradeEvent => |e: BonkTradeEvent| {
                 println!("BonkTradeEvent: {e:?}");
             },
-            BonkMigrateToAmmEvent => |e: bonk::BonkMigrateToAmmEvent| {
+            BonkMigrateToAmmEvent => |e: BonkMigrateToAmmEvent| {
                 println!("BonkMigrateToAmmEvent: {e:?}");
             },
-            BonkMigrateToCpswapEvent => |e: bonk::BonkMigrateToCpswapEvent| {
+            BonkMigrateToCpswapEvent => |e: BonkMigrateToCpswapEvent| {
                 println!("BonkMigrateToCpswapEvent: {e:?}");
             },
             // -------------------------- pumpfun -----------------------
-            PumpFunTradeEvent => |e: pumpfun::PumpFunTradeEvent| {
+            PumpFunTradeEvent => |e: PumpFunTradeEvent| {
                 println!("PumpFunTradeEvent: {e:?}");
             },
-            PumpFunMigrateEvent => |e: pumpfun::PumpFunMigrateEvent| {
+            PumpFunMigrateEvent => |e: PumpFunMigrateEvent| {
                 println!("PumpFunMigrateEvent: {e:?}");
             },
-            PumpFunCreateTokenEvent => |e: pumpfun::PumpFunCreateTokenEvent| {
+            PumpFunCreateTokenEvent => |e: PumpFunCreateTokenEvent| {
                 println!("PumpFunCreateTokenEvent: {e:?}");
             },
             // -------------------------- pumpswap -----------------------
-            PumpSwapBuyEvent => |e: pumpswap::PumpSwapBuyEvent| {
+            PumpSwapBuyEvent => |e: PumpSwapBuyEvent| {
                 println!("Buy event: {e:?}");
             },
-            PumpSwapSellEvent => |e: pumpswap::PumpSwapSellEvent| {
+            PumpSwapSellEvent => |e: PumpSwapSellEvent| {
                 println!("Sell event: {e:?}");
             },
-            PumpSwapCreatePoolEvent => |e: pumpswap::PumpSwapCreatePoolEvent| {
+            PumpSwapCreatePoolEvent => |e: PumpSwapCreatePoolEvent| {
                 println!("CreatePool event: {e:?}");
             },
-            PumpSwapDepositEvent => |e: pumpswap::PumpSwapDepositEvent| {
+            PumpSwapDepositEvent => |e: PumpSwapDepositEvent| {
                 println!("Deposit event: {e:?}");
             },
-            PumpSwapWithdrawEvent => |e: pumpswap::PumpSwapWithdrawEvent| {
+            PumpSwapWithdrawEvent => |e: PumpSwapWithdrawEvent| {
                 println!("Withdraw event: {e:?}");
             },
             // -------------------------- raydium_cpmm -----------------------
-            RaydiumCpmmSwapEvent => |e: raydium_cpmm::RaydiumCpmmSwapEvent| {
+            RaydiumCpmmSwapEvent => |e: RaydiumCpmmSwapEvent| {
                 println!("RaydiumCpmmSwapEvent: {e:?}");
             },
-            RaydiumCpmmDepositEvent => |e: raydium_cpmm::RaydiumCpmmDepositEvent| {
+            RaydiumCpmmDepositEvent => |e: RaydiumCpmmDepositEvent| {
                 println!("RaydiumCpmmDepositEvent: {e:?}");
             },
-            RaydiumCpmmInitializeEvent => |e: raydium_cpmm::RaydiumCpmmInitializeEvent| {
+            RaydiumCpmmInitializeEvent => |e: RaydiumCpmmInitializeEvent| {
                 println!("RaydiumCpmmInitializeEvent: {e:?}");
             },
-            RaydiumCpmmWithdrawEvent => |e: raydium_cpmm::RaydiumCpmmWithdrawEvent| {
+            RaydiumCpmmWithdrawEvent => |e: RaydiumCpmmWithdrawEvent| {
                 println!("RaydiumCpmmWithdrawEvent: {e:?}");
             },
             // -------------------------- raydium_clmm -----------------------
-            RaydiumClmmSwapEvent => |e: raydium_clmm::RaydiumClmmSwapEvent| {
+            RaydiumClmmSwapEvent => |e: RaydiumClmmSwapEvent| {
                 println!("RaydiumClmmSwapEvent: {e:?}");
             },
-            RaydiumClmmSwapV2Event => |e: raydium_clmm::RaydiumClmmSwapV2Event| {
+            RaydiumClmmSwapV2Event => |e: RaydiumClmmSwapV2Event| {
                 println!("RaydiumClmmSwapV2Event: {e:?}");
             },
-            RaydiumClmmClosePositionEvent => |e: raydium_clmm::RaydiumClmmClosePositionEvent| {
+            RaydiumClmmClosePositionEvent => |e: RaydiumClmmClosePositionEvent| {
                 println!("RaydiumClmmClosePositionEvent: {e:?}");
             },
-            RaydiumClmmDecreaseLiquidityV2Event => |e: raydium_clmm::RaydiumClmmDecreaseLiquidityV2Event| {
+            RaydiumClmmDecreaseLiquidityV2Event => |e: RaydiumClmmDecreaseLiquidityV2Event| {
                 println!("RaydiumClmmDecreaseLiquidityV2Event: {e:?}");
             },
-            RaydiumClmmCreatePoolEvent => |e: raydium_clmm::RaydiumClmmCreatePoolEvent| {
+            RaydiumClmmCreatePoolEvent => |e: RaydiumClmmCreatePoolEvent| {
                 println!("RaydiumClmmCreatePoolEvent: {e:?}");
             },
-            RaydiumClmmIncreaseLiquidityV2Event => |e: raydium_clmm::RaydiumClmmIncreaseLiquidityV2Event| {
+            RaydiumClmmIncreaseLiquidityV2Event => |e: RaydiumClmmIncreaseLiquidityV2Event| {
                 println!("RaydiumClmmIncreaseLiquidityV2Event: {e:?}");
             },
-            RaydiumClmmOpenPositionWithToken22NftEvent => |e: raydium_clmm::RaydiumClmmOpenPositionWithToken22NftEvent| {
+            RaydiumClmmOpenPositionWithToken22NftEvent => |e: RaydiumClmmOpenPositionWithToken22NftEvent| {
                 println!("RaydiumClmmOpenPositionWithToken22NftEvent: {e:?}");
             },
-            RaydiumClmmOpenPositionV2Event => |e: raydium_clmm::RaydiumClmmOpenPositionV2Event| {
+            RaydiumClmmOpenPositionV2Event => |e: RaydiumClmmOpenPositionV2Event| {
                 println!("RaydiumClmmOpenPositionV2Event: {e:?}");
             },
             // -------------------------- raydium_amm_v4 -----------------------
-            RaydiumAmmV4SwapEvent => |e: raydium_amm_v4::RaydiumAmmV4SwapEvent| {
+            RaydiumAmmV4SwapEvent => |e: RaydiumAmmV4SwapEvent| {
                 println!("RaydiumAmmV4SwapEvent: {e:?}");
             },
-            RaydiumAmmV4DepositEvent => |e: raydium_amm_v4::RaydiumAmmV4DepositEvent| {
+            RaydiumAmmV4DepositEvent => |e: RaydiumAmmV4DepositEvent| {
                 println!("RaydiumAmmV4DepositEvent: {e:?}");
             },
-            RaydiumAmmV4Initialize2Event => |e: raydium_amm_v4::RaydiumAmmV4Initialize2Event| {
+            RaydiumAmmV4Initialize2Event => |e: RaydiumAmmV4Initialize2Event| {
                 println!("RaydiumAmmV4Initialize2Event: {e:?}");
             },
-            RaydiumAmmV4WithdrawEvent => |e: raydium_amm_v4::RaydiumAmmV4WithdrawEvent| {
+            RaydiumAmmV4WithdrawEvent => |e: RaydiumAmmV4WithdrawEvent| {
                 println!("RaydiumAmmV4WithdrawEvent: {e:?}");
             },
-            RaydiumAmmV4WithdrawPnlEvent => |e: raydium_amm_v4::RaydiumAmmV4WithdrawPnlEvent| {
+            RaydiumAmmV4WithdrawPnlEvent => |e: RaydiumAmmV4WithdrawPnlEvent| {
                 println!("RaydiumAmmV4WithdrawPnlEvent: {e:?}");
             },
             // -------------------------- account -----------------------
-            BonkPoolStateAccountEvent => |e: bonk::BonkPoolStateAccountEvent| {
+            BonkPoolStateAccountEvent => |e: BonkPoolStateAccountEvent| {
                 println!("BonkPoolStateAccountEvent: {e:?}");
             },
-            BonkGlobalConfigAccountEvent => |e: bonk::BonkGlobalConfigAccountEvent| {
+            BonkGlobalConfigAccountEvent => |e: BonkGlobalConfigAccountEvent| {
                 println!("BonkGlobalConfigAccountEvent: {e:?}");
             },
-            BonkPlatformConfigAccountEvent => |e: bonk::BonkPlatformConfigAccountEvent| {
+            BonkPlatformConfigAccountEvent => |e: BonkPlatformConfigAccountEvent| {
                 println!("BonkPlatformConfigAccountEvent: {e:?}");
             },
-            PumpSwapGlobalConfigAccountEvent => |e: pumpswap::PumpSwapGlobalConfigAccountEvent| {
+            PumpSwapGlobalConfigAccountEvent => |e: PumpSwapGlobalConfigAccountEvent| {
                 println!("PumpSwapGlobalConfigAccountEvent: {e:?}");
             },
-            PumpSwapPoolAccountEvent => |e: pumpswap::PumpSwapPoolAccountEvent| {
+            PumpSwapPoolAccountEvent => |e: PumpSwapPoolAccountEvent| {
                 println!("PumpSwapPoolAccountEvent: {e:?}");
             },
-            PumpFunBondingCurveAccountEvent => |e: pumpfun::PumpFunBondingCurveAccountEvent| {
+            PumpFunBondingCurveAccountEvent => |e: PumpFunBondingCurveAccountEvent| {
                 println!("PumpFunBondingCurveAccountEvent: {e:?}");
             },
-            PumpFunGlobalAccountEvent => |e: pumpfun::PumpFunGlobalAccountEvent| {
+            PumpFunGlobalAccountEvent => |e: PumpFunGlobalAccountEvent| {
                 println!("PumpFunGlobalAccountEvent: {e:?}");
             },
-            RaydiumAmmV4AmmInfoAccountEvent => |e: raydium_amm_v4::RaydiumAmmV4AmmInfoAccountEvent| {
+            RaydiumAmmV4AmmInfoAccountEvent => |e: RaydiumAmmV4AmmInfoAccountEvent| {
                 println!("RaydiumAmmV4AmmInfoAccountEvent: {e:?}");
             },
-            RaydiumClmmAmmConfigAccountEvent => |e: raydium_clmm::RaydiumClmmAmmConfigAccountEvent| {
+            RaydiumClmmAmmConfigAccountEvent => |e: RaydiumClmmAmmConfigAccountEvent| {
                 println!("RaydiumClmmAmmConfigAccountEvent: {e:?}");
             },
-            RaydiumClmmPoolStateAccountEvent => |e: raydium_clmm::RaydiumClmmPoolStateAccountEvent| {
+            RaydiumClmmPoolStateAccountEvent => |e: RaydiumClmmPoolStateAccountEvent| {
                 println!("RaydiumClmmPoolStateAccountEvent: {e:?}");
             },
-            RaydiumClmmTickArrayStateAccountEvent => |e: raydium_clmm::RaydiumClmmTickArrayStateAccountEvent| {
+            RaydiumClmmTickArrayStateAccountEvent => |e: RaydiumClmmTickArrayStateAccountEvent| {
                 println!("RaydiumClmmTickArrayStateAccountEvent: {e:?}");
             },
-            RaydiumCpmmAmmConfigAccountEvent => |e: raydium_cpmm::RaydiumCpmmAmmConfigAccountEvent| {
+            RaydiumCpmmAmmConfigAccountEvent => |e: RaydiumCpmmAmmConfigAccountEvent| {
                 println!("RaydiumCpmmAmmConfigAccountEvent: {e:?}");
             },
-            RaydiumCpmmPoolStateAccountEvent => |e: raydium_cpmm::RaydiumCpmmPoolStateAccountEvent| {
+            RaydiumCpmmPoolStateAccountEvent => |e: RaydiumCpmmPoolStateAccountEvent| {
                 println!("RaydiumCpmmPoolStateAccountEvent: {e:?}");
             },
         });
