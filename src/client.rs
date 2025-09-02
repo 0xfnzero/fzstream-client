@@ -1193,12 +1193,12 @@ impl danger::ServerCertVerifier for NoCertificateVerification {
 }
 
 impl FzStreamClient {
-    /// Subscribe to events with event filter and handle Ctrl+C
+    /// Subscribe to events with event filter and return a handle to keep the process alive
     pub async fn subscribe_with_filter<F>(
         &mut self,
         event_filter: EventTypeFilter,
         callback: F,
-    ) -> Result<()>
+    ) -> Result<tokio::task::JoinHandle<()>>
     where
         F: Fn(Box<dyn UnifiedEvent>) + Send + Sync + 'static + Clone,
     {
@@ -1211,14 +1211,30 @@ impl FzStreamClient {
         // Start subscription
         self.subscribe(callback.clone()).await?;
         
-        // Create a handle that keeps the process alive
-        let mut handle = tokio::spawn(async move {
+        // Return a handle that keeps the process alive
+        let handle = tokio::spawn(async move {
             // Keep the subscription alive until cancelled
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
         });
-
+        
+        Ok(handle)
+    }
+    
+    /// Run the client with automatic Ctrl+C handling
+    /// Returns when Ctrl+C is pressed or subscription ends
+    pub async fn subscribe_with_shutdown<F>(
+        &mut self,
+        event_filter: EventTypeFilter,
+        callback: F,
+    ) -> Result<()>
+    where
+        F: Fn(Box<dyn UnifiedEvent>) + Send + Sync + 'static + Clone,
+    {
+        // Start subscription and get handle
+        let mut handle = self.subscribe_with_filter(event_filter, callback).await?;
+        
         // Setup Ctrl+C handler
         let shutdown = tokio::signal::ctrl_c();
         

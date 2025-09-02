@@ -37,9 +37,11 @@ async fn main() -> Result<()> {
     println!("🎯 设置事件过滤器为: {}", event_filter.get_summary());
     println!("📡 开始接收事件流... (按 Ctrl+C 停止)");
     println!("─────────────────────────────────────────────");
-    
+ 
+    // let _handle = client.subscribe_with_filter(event_filter, create_event_callback()).await?;
+
     // 使用内置的Ctrl+C处理 - 自动处理shutdown
-    client.subscribe_with_filter(event_filter, create_event_callback()).await?;
+    client.subscribe_with_shutdown(event_filter, create_event_callback()).await?;
     
     println!("✅ 程序已正常退出");
     Ok(())
