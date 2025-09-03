@@ -6,7 +6,7 @@ authors = ["William <byteblock6@gmail.com>"]
 repository = "https://github.com/0xfnzero/fz-stream-client"
 description = "A high-performance QUIC client SDK for real-time Solana event streaming with bincode support"
 license = "MIT"
-keywords = ["solana", "quic", "streaming", "events", "sdk", "fzs"]
+keywords = ["solana", "fzstream", "streaming", "events", "sdk"]
 categories = ["network-programming", "api-bindings", "asynchronous"]
 readme = "README.md"
 
