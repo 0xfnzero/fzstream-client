@@ -15,6 +15,7 @@ async fn main() -> Result<()> {
     env_logger::init();
             
     let server_addr = "http://127.0.0.1:2222"; 
+    // let server_addr = "http://64.130.37.195:2222"; 
     let auth_token = "demo_token_12345";   
 
     let mut client = FzStreamClient::builder()
